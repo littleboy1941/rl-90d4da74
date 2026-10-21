@@ -107,12 +107,14 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
         let background = Self.cameraImage(frame, viewport: viewport)
         var composed: CIImage
         if let face {
-            cameraNode.camera?.projectionTransform = SCNMatrix4(frame.camera.projectionMatrix(
+            let projection = frame.camera.projectionMatrix(
                 for: .portrait,
                 viewportSize: viewport,
                 zNear: 0.001,
-                zFar: 10))
-            cameraNode.simdTransform = frame.camera.viewMatrix(for: .portrait).inverse
+                zFar: 10)
+            let view = frame.camera.viewMatrix(for: .portrait)
+            cameraNode.camera?.projectionTransform = SCNMatrix4(projection)
+            cameraNode.simdTransform = view.inverse
             updateNodes(face)
             style.update(faceNodes, time: frame.timestamp)
             guard let layer = renderOverlay(time: frame.timestamp, side: side) else {
@@ -123,7 +125,10 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
                 deliver(composed, frame: frame, started: started, intervalMs: intervalMs, faces: 0, lost: true)
                 return
             }
-            composed = style.finish(layer.composited(over: style.backdrop(background)), time: frame.timestamp)
+            let shape = FaceShape(
+                points: Self.project(face, matrix: projection * view, viewport: viewport),
+                viewport: viewport)
+            composed = style.compose(camera: background, overlay: layer, face: shape, time: frame.timestamp)
         } else {
             faceNodes.forEach { $0.node.isHidden = true }
             let extent = CGRect(origin: .zero, size: viewport)
@@ -214,6 +219,21 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
         return image.transformed(by: CGAffineTransform(scaleX: 1, y: -1).translatedBy(x: 0, y: -CGFloat(side)))
     }
 
+    // Face mesh vertices in viewport pixels (Core Image coordinates, origin
+    // at the bottom left), same matrices as the SceneKit overlay.
+    static func project(_ face: ARFaceAnchor, matrix: simd_float4x4, viewport: CGSize) -> [CGPoint] {
+        let full = matrix * face.transform
+        return face.geometry.vertices.compactMap { vertex in
+            let clip = full * SIMD4<Float>(vertex, 1)
+            guard clip.w > 0 else {
+                return nil
+            }
+            let x = (clip.x / clip.w + 1) / 2 * Float(viewport.width)
+            let y = (clip.y / clip.w + 1) / 2 * Float(viewport.height)
+            return CGPoint(x: CGFloat(x), y: CGFloat(y))
+        }
+    }
+
     // ARKit camera image mapped into the portrait viewport (same mapping
     // ARKit uses for projectionMatrix(for:viewportSize:)).
     static func cameraImage(_ frame: ARFrame, viewport: CGSize) -> CIImage {
@@ -243,10 +263,30 @@ protocol FaceStyle {
     func finish(_ image: CIImage, time: Double) -> CIImage
     // Per-frame animation of the style's nodes (materials, offsets).
     func update(_ nodes: [StyledNode], time: Double)
+    func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage
+}
+
+// The tracked face in the output square: projected mesh vertices.
+struct FaceShape {
+    var points: [CGPoint]
+    var viewport: CGSize
+
+    var bounds: CGRect {
+        guard let first = points.first else {
+            return .null
+        }
+        return points.reduce(CGRect(origin: first, size: .zero)) { $0.union(CGRect(origin: $1, size: .zero)) }
+    }
 }
 
 extension FaceStyle {
     func update(_ nodes: [StyledNode], time: Double) {}
+
+    // Default: overlay over the backdrop, then 2D finishing. Styles that
+    // need the face outline in the image (smears, glitches) override this.
+    func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage {
+        finish(overlay.composited(over: backdrop(camera)), time: time)
+    }
 }
 
 // "Ghost in the mesh": the face is a dark mask that follows the head and
@@ -289,4 +329,4 @@ struct GhostStyle: FaceStyle {
     }
 }
 
-let allFaceStyles: [FaceStyle] = [TextFaceStyle(), GhostStyle()]
+let allFaceStyles: [FaceStyle] = [LeakStyle(), TextFaceStyle(), GhostStyle()]

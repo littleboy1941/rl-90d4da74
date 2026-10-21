@@ -86,6 +86,135 @@ struct TextFaceStyle: FaceStyle {
     }
 }
 
+// "Leak" (reference 2, Elliot poster): the real face stays visible; one
+// side of it leaks sideways into the dark in ragged horizontal streaks —
+// each band of rows takes the color at the face edge and stretches it out
+// for a random, flickering length. Low-key grade, CRT lines, color fringe
+// and a terminal prompt on top.
+struct LeakStyle: FaceStyle {
+    let name = "leak"
+    var bandHeight: CGFloat = 3
+    var maxLength: CGFloat = 0.9      // of the face width
+    var emptyShare = 0.3              // bands without a streak
+    var ticksPerSecond = 14.0         // how often streak lengths change
+
+    func makeNodes(device: MTLDevice) -> [StyledNode] {
+        // White unlit face: used only as a soft mask for the lighting.
+        guard let mesh = ARSCNFaceGeometry(device: device, fillMesh: true) else {
+            return []
+        }
+        let material = SCNMaterial()
+        material.diffuse.contents = UIColor.white
+        material.lightingModel = .constant
+        mesh.firstMaterial = material
+        return [StyledNode(node: SCNNode(geometry: mesh), scale: 1.0)]
+    }
+
+    func backdrop(_ camera: CIImage) -> CIImage {
+        camera
+    }
+
+    func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage {
+        let extent = camera.extent
+        // Low key: everything but the face falls into the dark.
+        let soft = overlay.clampedToExtent().applyingGaussianBlur(sigma: 14).cropped(to: extent)
+        let graded = camera.applyingFilter("CIColorControls", parameters: [
+            kCIInputSaturationKey: 0.55,
+            kCIInputContrastKey: 1.15,
+        ])
+        let dark = graded.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -2.2])
+        var image = graded.applyingFilter("CIBlendWithAlphaMask", parameters: [
+            kCIInputBackgroundImageKey: dark,
+            kCIInputMaskImageKey: soft,
+        ]).cropped(to: extent)
+
+        let bounds = face.bounds
+        if !bounds.isNull, bounds.width > 4 {
+            image = Self.streaks(over: image, face: face, bounds: bounds, style: self, time: time)
+        }
+        return finish(image, time: time)
+    }
+
+    static func streaks(over image: CIImage, face: FaceShape, bounds: CGRect, style: LeakStyle, time: Double) -> CIImage {
+        let extent = image.extent
+        let rows = Int(extent.height / style.bandHeight) + 1
+        var edges = [CGFloat](repeating: .greatestFiniteMagnitude, count: rows)
+        for point in face.points {
+            let row = Int(point.y / style.bandHeight)
+            if row >= 0, row < rows {
+                edges[row] = min(edges[row], point.x)
+            }
+        }
+        let tick = UInt64(max(0, Int(time * style.ticksPerSecond)))
+        var streaks = CIImage.empty()
+        for row in 0..<rows where edges[row] < .greatestFiniteMagnitude {
+            var generator = SplitMix(seed: UInt64(row) &* 7919 &+ tick &* 104_729)
+            let roll = Double(generator.next() % 10_000) / 10_000
+            guard roll >= style.emptyShare else {
+                continue
+            }
+            let strength = (roll - style.emptyShare) / (1 - style.emptyShare)
+            let length = bounds.width * style.maxLength * CGFloat(strength * strength)
+            guard length >= 2 else {
+                continue
+            }
+            let edge = edges[row]
+            let sampleX = floor(min(edge + bounds.width * 0.05, extent.maxX - 1))
+            let y = CGFloat(row) * style.bandHeight
+            let column = image
+                .cropped(to: CGRect(x: sampleX, y: y, width: 1, height: style.bandHeight))
+                .samplingNearest()
+                .transformed(by: CGAffineTransform(translationX: -sampleX, y: 0))
+                .transformed(by: CGAffineTransform(scaleX: length, y: 1))
+                .transformed(by: CGAffineTransform(translationX: edge - length, y: 0))
+            streaks = column.composited(over: streaks)
+        }
+        return streaks.composited(over: image).cropped(to: extent)
+    }
+
+    func finish(_ image: CIImage, time: Double) -> CIImage {
+        let extent = image.extent
+        // Cold tint, color fringe, CRT lines, vignette, terminal prompt.
+        var result = image.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 0.92, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: 0.97, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: 1.06, w: 0),
+        ])
+        result = SignalEffect.colorSplit(result, extent: extent, shift: 1.5)
+        result = SignalEffect.scanlines(extent: extent).composited(over: result)
+        result = result.applyingFilter("CIVignette", parameters: [
+            kCIInputIntensityKey: 0.9,
+            kCIInputRadiusKey: 1.4,
+        ])
+        if let prompt = Self.prompt(extent: extent, time: time) {
+            result = prompt.composited(over: result)
+        }
+        return result.cropped(to: extent)
+    }
+
+    // "root@elliot:~# _" near the top of the circle, cursor blinking.
+    static func prompt(extent: CGRect, time: Double) -> CIImage? {
+        let cursor = Int(time * 2) % 2 == 0 ? "_" : " "
+        guard let text = CIFilter(name: "CITextImageGenerator", parameters: [
+            "inputText": "root@elliot:~# " + cursor,
+            "inputFontName": "Menlo",
+            "inputFontSize": extent.width * 0.04,
+            "inputScaleFactor": 1,
+        ])?.outputImage else {
+            return nil
+        }
+        let tinted = text.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputBiasVector": CIVector(x: 0.85, y: 0.88, z: 0.9, w: 0),
+        ])
+        return tinted.transformed(by: CGAffineTransform(
+            translationX: extent.midX - tinted.extent.width / 2 - tinted.extent.minX,
+            y: extent.minY + extent.height * 0.8 - tinted.extent.minY))
+    }
+}
+
 // Small deterministic generator so the texture is the same every launch.
 struct SplitMix {
     private var state: UInt64
