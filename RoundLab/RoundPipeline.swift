@@ -164,7 +164,7 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let used = faces.isEmpty ? (held ? lastFaces : []) : faces
         let lost = visionFailed || used.isEmpty
 
-        let processed = effect.apply(to: source, faces: used, trackingLost: lost)
+        let processed = effect.apply(to: source, faces: used, trackingLost: lost, time: presentation.seconds)
         let square = min(width, height)
         let crop = CGRect(
             x: (width - square) / 2,

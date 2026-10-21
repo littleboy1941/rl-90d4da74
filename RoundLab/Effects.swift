@@ -11,9 +11,10 @@ struct Face {
 
 // Effect contract shared with the future Telegram port: Telegram's round
 // video filter (CameraRoundLegacyVideoFilter) also works on CIImage.
+// `time` is in seconds and drives animation.
 protocol RoundEffect {
     var name: String { get }
-    func apply(to image: CIImage, faces: [Face], trackingLost: Bool) -> CIImage
+    func apply(to image: CIImage, faces: [Face], trackingLost: Bool, time: Double) -> CIImage
 }
 
 // Step 1: opaque black oval over every face; whole frame black when the
@@ -22,7 +23,7 @@ struct BlackOvalEffect: RoundEffect {
     let name = "black_oval"
     var expansion: CGFloat = 0.25
 
-    func apply(to image: CIImage, faces: [Face], trackingLost: Bool) -> CIImage {
+    func apply(to image: CIImage, faces: [Face], trackingLost: Bool, time: Double) -> CIImage {
         let extent = image.extent
         if trackingLost {
             return CIImage(color: .black).cropped(to: extent)
@@ -42,20 +43,155 @@ struct BlackOvalEffect: RoundEffect {
 // landmarks) closed over the forehead with an arc, plus a margin.
 struct BlackSilhouetteEffect: RoundEffect {
     let name = "black_silhouette"
-    var margin: CGFloat = 0.12      // of the face width, all around
-    var foreheadLift: CGFloat = 0.35 // of the face height, above the box
 
-    func apply(to image: CIImage, faces: [Face], trackingLost: Bool) -> CIImage {
+    func apply(to image: CIImage, faces: [Face], trackingLost: Bool, time: Double) -> CIImage {
         let extent = image.extent
         if trackingLost {
             return CIImage(color: .black).cropped(to: extent)
         }
+        return Silhouette.mask(faces, extent: extent).image(over: image)
+    }
+}
+
+// Step 3: "signal" in the Mr. Robot spirit. The silhouette is filled with
+// moving synthetic static (no face pixels), the whole frame gets CRT lines,
+// a slight color split and a vignette; now and then a horizontal band of
+// the already covered frame slides sideways. Lost face: static + SIGNAL LOST.
+struct SignalEffect: RoundEffect {
+    let name = "signal"
+
+    func apply(to image: CIImage, faces: [Face], trackingLost: Bool, time: Double) -> CIImage {
+        let extent = image.extent
+        let noise = Self.staticNoise(extent: extent, time: time, brightness: 0.22)
+        var frame: CIImage
+        if trackingLost {
+            frame = Self.lostScreen(extent: extent, noise: noise, time: time)
+        } else {
+            let mask = Silhouette.mask(faces, extent: extent)
+            guard let alpha = mask.ciImage() else {
+                return CIImage(color: .black).cropped(to: extent)
+            }
+            // Black first (guarantee), static on top, both only inside the mask.
+            let covered = noise.composited(over: CIImage(color: .black).cropped(to: extent))
+            frame = covered.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                kCIInputBackgroundImageKey: image,
+                kCIInputMaskImageKey: alpha,
+            ]).cropped(to: extent)
+        }
+        frame = Self.glitchBand(frame, extent: extent, time: time)
+        frame = Self.colorSplit(frame, extent: extent, shift: 2)
+        frame = Self.scanlines(extent: extent).composited(over: frame)
+        frame = frame.applyingFilter("CIVignette", parameters: [
+            kCIInputIntensityKey: 0.8,
+            kCIInputRadiusKey: 1.6,
+        ])
+        return frame.cropped(to: extent)
+    }
+
+    // Grey static stretched into horizontal streaks, moving every frame.
+    static func staticNoise(extent: CGRect, time: Double, brightness: CGFloat) -> CIImage {
+        let random = CIFilter(name: "CIRandomGenerator")?.outputImage ?? CIImage(color: .black)
+        let offset = CGFloat(Int(time * 30) % 997) * 37
+        let grey = random
+            .transformed(by: CGAffineTransform(translationX: offset, y: offset * 0.61))
+            .applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: brightness, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: brightness, y: 0, z: 0, w: 0),
+                "inputBVector": CIVector(x: brightness, y: 0, z: 0, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+            ])
+            .transformed(by: CGAffineTransform(scaleX: 6, y: 1))
+        return grey.cropped(to: extent)
+    }
+
+    static func lostScreen(extent: CGRect, noise: CIImage, time: Double) -> CIImage {
+        let base = noise.composited(over: CIImage(color: .black).cropped(to: extent))
+        let blink = Int(time * 2) % 2 == 0
+        guard blink,
+              let text = CIFilter(name: "CITextImageGenerator", parameters: [
+                  "inputText": "SIGNAL LOST",
+                  "inputFontName": "Menlo-Bold",
+                  "inputFontSize": extent.width * 0.075,
+                  "inputScaleFactor": 1,
+              ])?.outputImage else {
+            return base
+        }
+        let white = text.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputBiasVector": CIVector(x: 0.92, y: 0.92, z: 0.9, w: 0),
+        ])
+        let placed = white.transformed(by: CGAffineTransform(
+            translationX: extent.midX - white.extent.width / 2 - white.extent.minX,
+            y: extent.midY - white.extent.height / 2 - white.extent.minY))
+        return placed.composited(over: base)
+    }
+
+    // For ~150 ms every ~1.7 s one horizontal band slides sideways.
+    static func glitchBand(_ image: CIImage, extent: CGRect, time: Double) -> CIImage {
+        let period = 1.7
+        let phase = time.truncatingRemainder(dividingBy: period)
+        guard phase < 0.15 else {
+            return image
+        }
+        let seed = Int(time / period)
+        let bandHeight = extent.height * CGFloat(0.06 + Double(seed % 5) * 0.03)
+        let bandY = extent.minY + extent.height * CGFloat((seed * 37) % 80) / 100
+        let shift = extent.width * CGFloat((seed % 2 == 0 ? 1 : -1) * (6 + seed % 9)) / 100
+        let band = CGRect(x: extent.minX, y: bandY, width: extent.width, height: bandHeight)
+        let moved = image
+            .transformed(by: CGAffineTransform(translationX: shift, y: 0))
+            .cropped(to: band)
+        let gap = CIImage(color: .black).cropped(to: band)
+        return moved.composited(over: gap.composited(over: image))
+    }
+
+    // Red shifted right, blue shifted left, green in place.
+    static func colorSplit(_ image: CIImage, extent: CGRect, shift: CGFloat) -> CIImage {
+        func channel(_ r: CGFloat, _ g: CGFloat, _ b: CGFloat, dx: CGFloat) -> CIImage {
+            image.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: r, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: g, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: b, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+            ]).transformed(by: CGAffineTransform(translationX: dx, y: 0))
+        }
+        let red = channel(1, 0, 0, dx: shift)
+        let green = channel(0, 1, 0, dx: 0)
+        let blue = channel(0, 0, 1, dx: -shift)
+        return red
+            .applyingFilter("CIAdditionCompositing", parameters: [kCIInputBackgroundImageKey: green])
+            .applyingFilter("CIAdditionCompositing", parameters: [kCIInputBackgroundImageKey: blue])
+            .cropped(to: extent)
+    }
+
+    // Thin dark horizontal lines every 3 px.
+    static func scanlines(extent: CGRect) -> CIImage {
+        let stripes = CIFilter(name: "CIStripesGenerator", parameters: [
+            "inputColor0": CIColor(red: 0, green: 0, blue: 0, alpha: 0.28),
+            "inputColor1": CIColor(red: 0, green: 0, blue: 0, alpha: 0),
+            "inputWidth": 1.5,
+            "inputSharpness": 1,
+        ])?.outputImage ?? CIImage(color: .clear)
+        return stripes
+            .transformed(by: CGAffineTransform(rotationAngle: .pi / 2))
+            .cropped(to: extent)
+    }
+}
+
+// Face silhouettes: jaw contour + forehead arc, filled and stroked with a margin.
+enum Silhouette {
+    static let margin: CGFloat = 0.12       // of the face width, all around
+    static let foreheadLift: CGFloat = 0.35 // of the face height, above the box
+
+    static func mask(_ faces: [Face], extent: CGRect) -> Mask {
         let mask = Mask(extent: extent)
         guard let context = mask.context else {
-            return CIImage(color: .black).cropped(to: extent)
+            return mask
         }
         for face in faces {
-            let path = Self.silhouette(face, lift: foreheadLift)
+            let path = Self.path(face)
             context.addPath(path)
             context.fillPath()
             context.setLineJoin(.round)
@@ -63,16 +199,16 @@ struct BlackSilhouetteEffect: RoundEffect {
             context.addPath(path)
             context.strokePath()
         }
-        return mask.image(over: image)
+        return mask
     }
 
-    static func silhouette(_ face: Face, lift: CGFloat) -> CGPath {
+    static func path(_ face: Face) -> CGPath {
         let path = CGMutablePath()
         let rect = face.rect
         guard face.contour.count >= 3,
               let first = face.contour.first,
               let last = face.contour.last else {
-            path.addEllipse(in: rect.insetBy(dx: 0, dy: -rect.height * lift / 2))
+            path.addEllipse(in: rect.insetBy(dx: 0, dy: -rect.height * foreheadLift / 2))
             return path
         }
         path.move(to: first)
@@ -80,7 +216,7 @@ struct BlackSilhouetteEffect: RoundEffect {
             path.addLine(to: point)
         }
         // Forehead: arc from the last contour point over the top back to the first.
-        let top = CGPoint(x: (first.x + last.x) / 2, y: rect.maxY + rect.height * lift)
+        let top = CGPoint(x: (first.x + last.x) / 2, y: rect.maxY + rect.height * foreheadLift)
         path.addQuadCurve(
             to: CGPoint(x: (last.x + top.x) / 2, y: top.y),
             control: CGPoint(x: last.x, y: top.y))
@@ -94,6 +230,7 @@ struct BlackSilhouetteEffect: RoundEffect {
 
 // Black-on-transparent mask drawn with Core Graphics (same coordinates as
 // Core Image: origin at the bottom left), composited over the frame.
+// Any failure turns into a fully black frame (fail closed).
 final class Mask {
     let extent: CGRect
     let context: CGContext?
@@ -113,14 +250,20 @@ final class Mask {
         context?.setStrokeColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
     }
 
-    func image(over source: CIImage) -> CIImage {
+    func ciImage() -> CIImage? {
         guard let cgImage = context?.makeImage() else {
+            return nil
+        }
+        return CIImage(cgImage: cgImage)
+            .transformed(by: CGAffineTransform(translationX: extent.minX, y: extent.minY))
+    }
+
+    func image(over source: CIImage) -> CIImage {
+        guard let overlay = ciImage() else {
             return CIImage(color: .black).cropped(to: extent)
         }
-        let overlay = CIImage(cgImage: cgImage)
-            .transformed(by: CGAffineTransform(translationX: extent.minX, y: extent.minY))
         return overlay.composited(over: source)
     }
 }
 
-let allEffects: [RoundEffect] = [BlackSilhouetteEffect(), BlackOvalEffect()]
+let allEffects: [RoundEffect] = [SignalEffect(), BlackSilhouetteEffect(), BlackOvalEffect()]
