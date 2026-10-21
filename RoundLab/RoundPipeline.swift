@@ -3,41 +3,63 @@ import CoreImage
 import QuartzCore
 import Vision
 
+// A camera source that turns frames into 400x400 processed frames for RoundOutput.
+protocol FrameSource: AnyObject {
+    func start()
+    func stop()
+}
+
 // Mirrors the Telegram round video path: front camera (32BGRA, up to
-// 640x480) -> effect -> 400x400 square -> preview and H.264 writer.
+// 640x480) -> Vision face landmarks -> 2D effect -> 400x400 square.
 // Preview and recording get the same processed frame, so nothing raw
 // can reach the file.
-final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
-    struct Stats {
-        var intervalMs: Double
-        var visionMs: Double
-        var renderMs: Double
-        var faces: Int
-        var held: Bool
-        var lost: Bool
-    }
-
+final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
-    let side = 400
-    var effect: RoundEffect = allEffects[0]
     var holdSeconds: CFTimeInterval = 0.5
 
-    // Called on the video queue.
-    var onFrame: ((CMSampleBuffer, Stats) -> Void)?
-
-    private let output = AVCaptureVideoDataOutput()
+    private let output: RoundOutput
+    private let videoOutput = AVCaptureVideoDataOutput()
     private let queue = DispatchQueue(label: "roundlab.video")
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let colorSpace = CGColorSpaceCreateDeviceRGB()
     private let sequenceHandler = VNSequenceRequestHandler()
-    private var pool: CVPixelBufferPool?
+    private var effect: RoundEffect
+    private var configured = false
     private var lastPresentation: CMTime?
     private var lastFaces: [Face] = []
     private var lastFaceTime: CFTimeInterval = -1
-    private var writer: RoundWriter?
-    private let log = FrameLog()
 
-    func configure() throws {
+    init(output: RoundOutput, effect: RoundEffect) {
+        self.output = output
+        self.effect = effect
+    }
+
+    func setEffect(_ next: RoundEffect) {
+        queue.async { [self] in
+            effect = next
+        }
+    }
+
+    func start() {
+        queue.async { [self] in
+            if !configured {
+                configured = (try? configure()) != nil
+            }
+            if !session.isRunning {
+                session.startRunning()
+            }
+        }
+    }
+
+    func stop() {
+        queue.async { [session] in
+            if session.isRunning {
+                session.stopRunning()
+            }
+        }
+    }
+
+    private func configure() throws {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         session.sessionPreset = .vga640x480
@@ -54,13 +76,13 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         if session.canAddInput(input) {
             session.addInput(input)
         }
-        output.videoSettings = [
+        videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         ]
-        output.alwaysDiscardsLateVideoFrames = true
-        output.setSampleBufferDelegate(self, queue: queue)
-        if session.canAddOutput(output) {
-            session.addOutput(output)
+        videoOutput.alwaysDiscardsLateVideoFrames = true
+        videoOutput.setSampleBufferDelegate(self, queue: queue)
+        if session.canAddOutput(videoOutput) {
+            session.addOutput(videoOutput)
         }
         // Buffers stay in the sensor orientation (landscape); the pipeline
         // rotates and mirrors them itself, like Telegram's round video filter.
@@ -75,46 +97,8 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         }
     }
 
-    func start() {
-        queue.async { [session] in
-            if !session.isRunning {
-                session.startRunning()
-            }
-        }
-    }
-
-    func setEffect(_ next: RoundEffect) {
-        queue.async { [self] in
-            effect = next
-        }
-    }
-
-    var isRecording: Bool {
-        queue.sync { writer != nil }
-    }
-
-    func startRecording() {
-        queue.async { [self] in
-            guard writer == nil else {
-                return
-            }
-            writer = try? RoundWriter(side: side)
-        }
-    }
-
-    func stopRecording(completion: @escaping (URL?) -> Void) {
-        queue.async { [self] in
-            guard let current = writer else {
-                completion(nil)
-                return
-            }
-            writer = nil
-            current.finish(completion: completion)
-        }
-    }
-
     func captureOutput(
-        _ output: AVCaptureOutput,
+        _ captureOutput: AVCaptureOutput,
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
@@ -165,6 +149,7 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let lost = visionFailed || used.isEmpty
 
         let processed = effect.apply(to: source, faces: used, trackingLost: lost, time: presentation.seconds)
+        let side = output.side
         let square = min(width, height)
         let crop = CGRect(
             x: (width - square) / 2,
@@ -177,7 +162,7 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
             .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
 
-        guard let target = makeBuffer() else {
+        guard let target = output.makeBuffer() else {
             return
         }
         context.render(
@@ -187,159 +172,16 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             colorSpace: colorSpace)
         let renderEnd = CACurrentMediaTime()
 
-        writer?.append(target, at: presentation)
-
-        let stats = Stats(
-            intervalMs: intervalMs,
-            visionMs: (visionEnd - visionStart) * 1000,
-            renderMs: (renderEnd - visionEnd) * 1000,
-            faces: faces.count,
-            held: held,
-            lost: lost)
-        log.write(presentation: presentation, stats: stats, recording: writer != nil)
-
-        if let sample = makeSample(target, like: sampleBuffer, at: presentation) {
-            onFrame?(sample, stats)
-        }
-    }
-
-    private func makeBuffer() -> CVPixelBuffer? {
-        if pool == nil {
-            let attributes: [String: Any] = [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: side,
-                kCVPixelBufferHeightKey as String: side,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
-            ]
-            CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
-        }
-        guard let pool else {
-            return nil
-        }
-        var buffer: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(nil, pool, &buffer)
-        return buffer
-    }
-
-    private func makeSample(
-        _ buffer: CVPixelBuffer,
-        like original: CMSampleBuffer,
-        at presentation: CMTime
-    ) -> CMSampleBuffer? {
-        var format: CMVideoFormatDescription?
-        CMVideoFormatDescriptionCreateForImageBuffer(
-            allocator: nil,
-            imageBuffer: buffer,
-            formatDescriptionOut: &format)
-        guard let format else {
-            return nil
-        }
-        var timing = CMSampleTimingInfo(
-            duration: CMSampleBufferGetDuration(original),
-            presentationTimeStamp: presentation,
-            decodeTimeStamp: .invalid)
-        var sample: CMSampleBuffer?
-        CMSampleBufferCreateReadyWithImageBuffer(
-            allocator: nil,
-            imageBuffer: buffer,
-            formatDescription: format,
-            sampleTiming: &timing,
-            sampleBufferOut: &sample)
-        if let sample,
-           let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, createIfNecessary: true),
-           CFArrayGetCount(attachments) > 0 {
-            let dictionary = unsafeBitCast(
-                CFArrayGetValueAtIndex(attachments, 0),
-                to: CFMutableDictionary.self)
-            CFDictionarySetValue(
-                dictionary,
-                Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
-                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque())
-        }
-        return sample
-    }
-}
-
-// H.264 400x400 MP4 in Documents, like a Telegram round video (no audio yet).
-final class RoundWriter {
-    let url: URL
-    private let writer: AVAssetWriter
-    private let input: AVAssetWriterInput
-    private let adaptor: AVAssetWriterInputPixelBufferAdaptor
-    private var started = false
-
-    init(side: Int) throws {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        url = FrameLog.documents.appendingPathComponent("round-\(formatter.string(from: Date())).mp4")
-        writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
-            AVVideoWidthKey: side,
-            AVVideoHeightKey: side,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: 1_000_000,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-            ],
-        ])
-        input.expectsMediaDataInRealTime = true
-        adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: nil)
-        writer.add(input)
-    }
-
-    func append(_ buffer: CVPixelBuffer, at time: CMTime) {
-        if !started {
-            guard writer.startWriting() else {
-                return
-            }
-            writer.startSession(atSourceTime: time)
-            started = true
-        }
-        if input.isReadyForMoreMediaData {
-            adaptor.append(buffer, withPresentationTime: time)
-        }
-    }
-
-    func finish(completion: @escaping (URL?) -> Void) {
-        guard started else {
-            completion(nil)
-            return
-        }
-        input.markAsFinished()
-        writer.finishWriting { [writer, url] in
-            completion(writer.status == .completed ? url : nil)
-        }
-    }
-}
-
-// One CSV per launch in Documents (visible in the Files app and over USB).
-final class FrameLog {
-    static let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-
-    private let handle: FileHandle?
-
-    init() {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyyMMdd-HHmmss"
-        let url = Self.documents.appendingPathComponent("frames-\(formatter.string(from: Date())).csv")
-        FileManager.default.createFile(
-            atPath: url.path,
-            contents: Data("pts_ms,interval_ms,vision_ms,render_ms,faces,held,lost,recording\n".utf8))
-        handle = try? FileHandle(forWritingTo: url)
-        _ = try? handle?.seekToEnd()
-    }
-
-    func write(presentation: CMTime, stats: RoundPipeline.Stats, recording: Bool) {
-        let line = String(
-            format: "%.1f,%.1f,%.2f,%.2f,%d,%d,%d,%d\n",
-            presentation.seconds * 1000,
-            stats.intervalMs,
-            stats.visionMs,
-            stats.renderMs,
-            stats.faces,
-            stats.held ? 1 : 0,
-            stats.lost ? 1 : 0,
-            recording ? 1 : 0)
-        try? handle?.write(contentsOf: Data(line.utf8))
+        output.deliver(
+            target,
+            at: presentation,
+            duration: CMSampleBufferGetDuration(sampleBuffer),
+            stats: RoundOutput.Stats(
+                intervalMs: intervalMs,
+                trackMs: (visionEnd - visionStart) * 1000,
+                renderMs: (renderEnd - visionEnd) * 1000,
+                faces: faces.count,
+                held: held,
+                lost: lost))
     }
 }
