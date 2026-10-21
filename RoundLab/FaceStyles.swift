@@ -1,5 +1,6 @@
 import ARKit
 import CoreImage
+import Metal
 import SceneKit
 import UIKit
 
@@ -90,6 +91,8 @@ struct TextFaceStyle: FaceStyle {
 // blown out to white on black; its left side leaks into the dark in dense
 // horizontal streaks one LED row tall, some rows inside the face slide
 // sideways, and the whole picture is shown as a low-res LED dot matrix.
+// Streaks, fringe and LED matrix run in one Metal pass (LeakGPU); the
+// program is the same every frame, only the per-row numbers change.
 struct LeakStyle: FaceStyle {
     let name = "leak"
     var cell: CGFloat = 5             // LED dot pitch in output pixels
@@ -125,81 +128,59 @@ struct LeakStyle: FaceStyle {
         ])
         let bright = graded.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: 0.45])
         let dark = graded.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -2.8])
-        var image = bright.applyingFilter("CIBlendWithAlphaMask", parameters: [
+        let image = bright.applyingFilter("CIBlendWithAlphaMask", parameters: [
             kCIInputBackgroundImageKey: dark,
             kCIInputMaskImageKey: soft,
         ]).cropped(to: extent)
 
-        let bounds = face.bounds
-        if !bounds.isNull, bounds.width > 4 {
-            image = streaks(over: image, face: face, bounds: bounds, time: time)
-        }
-        return finish(image, time: time)
+        let rows = streakRows(face: face, extent: extent, time: time)
+        let leaked = LeakGPU.shared.run(image, rows: rows, cell: Float(cell))
+            ?? SignalEffect.colorSplit(image, extent: extent, shift: 2)
+        return finish(leaked, time: time)
     }
 
-    func streaks(over image: CIImage, face: FaceShape, bounds: CGRect, time: Double) -> CIImage {
-        let extent = image.extent
-        let rows = Int(extent.height / cell) + 1
-        var left = [CGFloat](repeating: .greatestFiniteMagnitude, count: rows)
-        var right = [CGFloat](repeating: -.greatestFiniteMagnitude, count: rows)
+    // Per LED row (Core Image rows, bottom up): streak and slide numbers.
+    func streakRows(face: FaceShape, extent: CGRect, time: Double) -> [LeakRow] {
+        let count = Int(ceil(extent.height / cell))
+        var rows = [LeakRow](repeating: LeakRow(), count: count)
+        let bounds = face.bounds
+        guard !bounds.isNull, bounds.width > 4 else {
+            return rows
+        }
+        var left = [CGFloat](repeating: .greatestFiniteMagnitude, count: count)
+        var right = [CGFloat](repeating: -.greatestFiniteMagnitude, count: count)
         for point in face.points {
             let row = Int(point.y / cell)
-            if row >= 0, row < rows {
+            if row >= 0, row < count {
                 left[row] = min(left[row], point.x)
                 right[row] = max(right[row], point.x)
             }
         }
         let tick = UInt64(max(0, Int(time * ticksPerSecond)))
-        var layer = CIImage.empty()
-        for row in 0..<rows where left[row] < .greatestFiniteMagnitude {
+        for row in 0..<count where left[row] < .greatestFiniteMagnitude {
             var generator = SplitMix(seed: UInt64(row) &* 7919 &+ tick &* 104_729)
             let roll = Double(generator.next() % 10_000) / 10_000
-            let y = CGFloat(row) * cell
-            let band = CGRect(x: extent.minX, y: y, width: extent.width, height: cell)
-
-            // Some rows inside the face slide sideways (glitch).
+            var params = LeakRow()
+            params.left = Float(left[row])
+            params.right = Float(right[row])
             if roll < shiftedShare {
-                let shift = -cell * CGFloat(2 + generator.next() % 6)
-                let span = CGRect(x: left[row], y: y, width: max(right[row] - left[row], 1), height: cell)
-                let moved = image.cropped(to: span)
-                    .transformed(by: CGAffineTransform(translationX: shift, y: 0))
-                    .cropped(to: band)
-                layer = moved.composited(over: layer)
+                params.shift = -Float(cell) * Float(2 + generator.next() % 6)
             }
-            guard roll >= emptyShare else {
-                continue
+            if roll >= emptyShare {
+                let strength = (roll - emptyShare) / (1 - emptyShare)
+                let inside = bounds.width * (0.04 + 0.1 * Double(generator.next() % 100) / 100)
+                params.edge = Float(left[row])
+                params.length = Float(bounds.width * maxLength * CGFloat(0.2 + 0.8 * strength))
+                params.sampleX = Float(min(left[row] + inside, extent.maxX - 1))
             }
-            // Streak: the color just inside the left edge, stretched out to the left.
-            let strength = (roll - emptyShare) / (1 - emptyShare)
-            let length = bounds.width * maxLength * CGFloat(0.2 + 0.8 * strength)
-            let edge = left[row]
-            let inside = bounds.width * (0.04 + 0.1 * Double(generator.next() % 100) / 100)
-            let sampleX = floor(min(edge + inside, extent.maxX - 1))
-            let streak = image
-                .cropped(to: CGRect(x: sampleX, y: y, width: 1, height: cell))
-                .samplingNearest()
-                .transformed(by: CGAffineTransform(translationX: -sampleX, y: 0))
-                .transformed(by: CGAffineTransform(scaleX: length + inside, y: 1))
-                .transformed(by: CGAffineTransform(translationX: edge - length, y: 0))
-            // Tips go teal and fade, like the reference.
-            let tip = CGRect(x: edge - length, y: y, width: length * 0.35, height: cell)
-            let teal = streak.cropped(to: tip).applyingFilter("CIColorMatrix", parameters: [
-                "inputRVector": CIVector(x: 0.35, y: 0, z: 0, w: 0),
-                "inputGVector": CIVector(x: 0, y: 0.8, z: 0, w: 0),
-                "inputBVector": CIVector(x: 0, y: 0, z: 0.75, w: 0),
-                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0.8),
-            ])
-            layer = teal.composited(over: streak.composited(over: layer))
+            rows[row] = params
         }
-        return layer.composited(over: image).cropped(to: extent)
+        return rows
     }
 
     func finish(_ image: CIImage, time: Double) -> CIImage {
         let extent = image.extent
-        // Faint red fringe, then the LED dot matrix, then the prompt on top.
-        var result = SignalEffect.colorSplit(image, extent: extent, shift: 2)
-        result = Self.ledMatrix(result, extent: extent, cell: cell)
-        result = result.applyingFilter("CIVignette", parameters: [
+        var result = image.applyingFilter("CIVignette", parameters: [
             kCIInputIntensityKey: 0.7,
             kCIInputRadiusKey: 1.5,
         ])
@@ -207,44 +188,6 @@ struct LeakStyle: FaceStyle {
             result = prompt.composited(over: result)
         }
         return result.cropped(to: extent)
-    }
-
-    // Low-res picture shown as square LED dots with dark gaps.
-    static func ledMatrix(_ image: CIImage, extent: CGRect, cell: CGFloat) -> CIImage {
-        let blocks = image.applyingFilter("CIPixellate", parameters: [
-            kCIInputCenterKey: CIVector(x: cell / 2, y: cell / 2),
-            kCIInputScaleKey: cell,
-        ])
-        return blocks
-            .applyingFilter("CIMultiplyCompositing", parameters: [
-                kCIInputBackgroundImageKey: dotTile(cell: Int(cell)),
-            ])
-            .cropped(to: extent)
-    }
-
-    // One LED: a rounded bright square with a dark gap around it, tiled.
-    static func dotTile(cell: Int) -> CIImage {
-        let size = CGFloat(cell)
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: {
-            let format = UIGraphicsImageRendererFormat()
-            format.scale = 1
-            format.opaque = true
-            return format
-        }())
-        let image = renderer.image { context in
-            UIColor(white: 0.12, alpha: 1).setFill()
-            context.fill(CGRect(x: 0, y: 0, width: size, height: size))
-            UIColor.white.setFill()
-            UIBezierPath(
-                roundedRect: CGRect(x: 0.5, y: 0.5, width: size - 1.5, height: size - 1.5),
-                cornerRadius: size * 0.2).fill()
-        }
-        guard let cgImage = image.cgImage else {
-            return CIImage(color: .white)
-        }
-        return CIImage(cgImage: cgImage).applyingFilter("CIAffineTile", parameters: [
-            kCIInputTransformKey: NSValue(cgAffineTransform: .identity),
-        ])
     }
 
     // "root@elliot:~# _" near the top of the circle, cursor blinking.
@@ -268,6 +211,151 @@ struct LeakStyle: FaceStyle {
             translationX: extent.midX - tinted.extent.width / 2 - tinted.extent.minX,
             y: extent.minY + extent.height * 0.8 - tinted.extent.minY))
     }
+}
+
+// Same memory layout as `Row` in LeakGPU's Metal source (6 floats).
+struct LeakRow {
+    var edge: Float = 0
+    var length: Float = 0
+    var sampleX: Float = 0
+    var left: Float = 0
+    var right: Float = 0
+    var shift: Float = 0
+}
+
+// One compute pass: streaks + slid rows + color fringe + LED dot matrix.
+// Texture rows follow Core Image rows (bottom up) in both directions, so
+// row indices match LeakRow indices without flipping.
+final class LeakGPU {
+    static let shared = LeakGPU()
+
+    private struct Params {
+        var cell: Float
+        var width: Float
+        var height: Float
+        var rows: UInt32
+    }
+
+    private let device: MTLDevice?
+    private let queue: MTLCommandQueue?
+    private let pipeline: MTLComputePipelineState?
+    private let context: CIContext?
+    private var source: MTLTexture?
+    private var target: MTLTexture?
+    private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+
+    private init() {
+        device = MTLCreateSystemDefaultDevice()
+        queue = device?.makeCommandQueue()
+        context = device.map { CIContext(mtlDevice: $0, options: [.cacheIntermediates: false]) }
+        if let device,
+           let library = try? device.makeLibrary(source: Self.shader, options: nil),
+           let function = library.makeFunction(name: "leak") {
+            pipeline = try? device.makeComputePipelineState(function: function)
+        } else {
+            pipeline = nil
+        }
+    }
+
+    func run(_ image: CIImage, rows: [LeakRow], cell: Float) -> CIImage? {
+        let width = Int(image.extent.width)
+        let height = Int(image.extent.height)
+        guard let device, let queue, let pipeline, let context, !rows.isEmpty, width > 0, height > 0 else {
+            return nil
+        }
+        if source?.width != width || source?.height != height {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+            descriptor.storageMode = .private
+            descriptor.usage = [.shaderRead, .shaderWrite, .renderTarget]
+            source = device.makeTexture(descriptor: descriptor)
+            target = device.makeTexture(descriptor: descriptor)
+        }
+        guard let source, let target,
+              let commandBuffer = queue.makeCommandBuffer() else {
+            return nil
+        }
+        context.render(
+            image,
+            to: source,
+            commandBuffer: commandBuffer,
+            bounds: image.extent,
+            colorSpace: colorSpace)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            return nil
+        }
+        var params = Params(cell: cell, width: Float(width), height: Float(height), rows: UInt32(rows.count))
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(source, index: 0)
+        encoder.setTexture(target, index: 1)
+        rows.withUnsafeBytes { bytes in
+            encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 0)
+        }
+        encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 1)
+        let group = MTLSize(width: 16, height: 16, depth: 1)
+        let grid = MTLSize(width: (width + 15) / 16, height: (height + 15) / 16, depth: 1)
+        encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: group)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else {
+            return nil
+        }
+        return CIImage(mtlTexture: target, options: [.colorSpace: colorSpace])
+    }
+
+    private static let shader = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    struct Row { float edge; float length; float sampleX; float left; float right; float shift; };
+    struct Params { float cell; float width; float height; uint rows; };
+
+    static float4 leaked(texture2d<float, access::read> src, int2 p,
+                         constant Row *rows, constant Params &prm) {
+        int w = int(prm.width);
+        int h = int(prm.height);
+        p = clamp(p, int2(0), int2(w - 1, h - 1));
+        uint index = min(uint(float(p.y) / prm.cell), prm.rows - 1);
+        Row row = rows[index];
+        float x = float(p.x);
+        float4 c = src.read(uint2(p));
+        if (row.shift != 0.0 && x >= row.left && x <= row.right) {
+            int sx = clamp(int(x - row.shift), 0, w - 1);
+            c = src.read(uint2(sx, p.y));
+        }
+        if (row.length > 0.0 && x >= row.edge - row.length && x < row.sampleX) {
+            c = src.read(uint2(int(row.sampleX), p.y));
+            if (x < row.edge - row.length * 0.65) {
+                c.rgb *= float3(0.35, 0.8, 0.75);
+            }
+        }
+        return c;
+    }
+
+    kernel void leak(texture2d<float, access::read> src [[texture(0)]],
+                     texture2d<float, access::write> dst [[texture(1)]],
+                     constant Row *rows [[buffer(0)]],
+                     constant Params &prm [[buffer(1)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) {
+            return;
+        }
+        float cell = prm.cell;
+        float2 origin = floor(float2(gid) / cell) * cell;
+        int2 center = int2(origin + cell * 0.5);
+        float r = leaked(src, center + int2(2, 0), rows, prm).r;
+        float g = leaked(src, center, rows, prm).g;
+        float b = leaked(src, center - int2(2, 0), rows, prm).b;
+        float2 local = float2(gid) - origin + 0.5;
+        float half_size = (cell - 1.5) * 0.5;
+        float radius = cell * 0.2;
+        float2 q = abs(local - (0.5 + half_size)) - (half_size - radius);
+        float d = length(max(q, 0.0)) - radius;
+        float led = d <= 0.0 ? 1.0 : 0.12;
+        dst.write(float4(float3(r, g, b) * led, 1.0), gid);
+    }
+    """
 }
 
 // Small deterministic generator so the texture is the same every launch.

@@ -27,6 +27,10 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
     private var overlay: MTLTexture?
     private var depth: MTLTexture?
     private var lastTimestamp: TimeInterval?
+    private var settleFrames = 0
+    private var overlayMs = 0.0
+    private static let staleAfter: CFTimeInterval = 0.05
+    private static let settleAfterLoss = 4
 
     init?(output: RoundOutput, style: FaceStyle) {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -94,14 +98,30 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let started = CACurrentMediaTime()
+        // Latest frame wins: a frame that waited behind a slow one is dropped,
+        // so the picture never lags further behind the head.
+        // (Ages over a second mean a different clock: then nothing is dropped.)
+        let age = started - frame.timestamp
+        if age > Self.staleAfter, age < 1 {
+            return
+        }
+        overlayMs = 0
         let side = output.side
         let viewport = CGSize(width: side, height: side)
         let intervalMs = lastTimestamp.map { (frame.timestamp - $0) * 1000 } ?? 0
         lastTimestamp = frame.timestamp
 
-        let face = frame.anchors
+        var face = frame.anchors
             .compactMap { $0 as? ARFaceAnchor }
             .first { $0.isTracked }
+        // After the face comes back, keep the lost screen for a few frames
+        // until the mesh settles (otherwise the bare face flashes).
+        if face == nil {
+            settleFrames = Self.settleAfterLoss
+        } else if settleFrames > 0 {
+            settleFrames -= 1
+            face = nil
+        }
 
         // Camera image in the same portrait square the projection uses.
         let background = Self.cameraImage(frame, viewport: viewport)
@@ -117,7 +137,10 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
             cameraNode.simdTransform = view.inverse
             updateNodes(face)
             style.update(faceNodes, time: frame.timestamp)
-            guard let layer = renderOverlay(time: frame.timestamp, side: side) else {
+            let overlayStart = CACurrentMediaTime()
+            let layer = renderOverlay(time: frame.timestamp, side: side)
+            overlayMs = (CACurrentMediaTime() - overlayStart) * 1000
+            guard let layer else {
                 composed = SignalEffect.lostScreen(
                     extent: CGRect(origin: .zero, size: viewport),
                     noise: SignalEffect.staticNoise(extent: CGRect(origin: .zero, size: viewport), time: frame.timestamp, brightness: 0.22),
@@ -157,8 +180,8 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
             duration: CMTime(value: 1, timescale: 30),
             stats: RoundOutput.Stats(
                 intervalMs: intervalMs,
-                trackMs: 0,
-                renderMs: (CACurrentMediaTime() - started) * 1000,
+                trackMs: overlayMs,
+                renderMs: (CACurrentMediaTime() - started) * 1000 - overlayMs,
                 faces: faces,
                 held: false,
                 lost: lost))
