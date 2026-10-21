@@ -7,6 +7,7 @@ Signing material lives in C:/Users/society/ios-signing (never printed).
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -63,9 +64,11 @@ def pull():
         [PMD, "apps", "afc", "--documents", BUNDLE],
         input="ls /Documents\nexit\n", capture_output=True, text=True).stdout
     print(listing)
-    for name in listing.replace("", "").split():
-        if name.endswith((".csv", ".mp4")):
-            run([PMD, "apps", "pull", "--documents", BUNDLE, f"/Documents/{name}", target / name], env={**__import__("os").environ, "MSYS_NO_PATHCONV": "1"})
+    # Git Bash rewrites "/Documents/..." arguments into Windows paths.
+    env = {**os.environ, "MSYS_NO_PATHCONV": "1"}
+    for name in listing.split():
+        if name.endswith((".csv", ".mp4")) and not (target / name).exists():
+            run([PMD, "apps", "pull", "--documents", BUNDLE, f"/Documents/{name}", target / name], env=env)
 
 
 if __name__ == "__main__":
