@@ -46,6 +46,21 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
         camera.zFar = 10
         cameraNode.camera = camera
         scene.rootNode.addChildNode(cameraNode)
+        // Lights live in camera space: a key light from the upper left and a
+        // dim ambient, so lit styles show the shape of the head.
+        let key = SCNLight()
+        key.type = .directional
+        key.intensity = 1100
+        let keyNode = SCNNode()
+        keyNode.light = key
+        keyNode.eulerAngles = SCNVector3(-0.5, -0.6, 0)
+        cameraNode.addChildNode(keyNode)
+        let ambient = SCNLight()
+        ambient.type = .ambient
+        ambient.intensity = 180
+        let ambientNode = SCNNode()
+        ambientNode.light = ambient
+        cameraNode.addChildNode(ambientNode)
         scene.background.contents = nil
         renderer.scene = scene
         renderer.pointOfView = cameraNode
@@ -99,6 +114,7 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
                 zFar: 10))
             cameraNode.simdTransform = frame.camera.viewMatrix(for: .portrait).inverse
             updateNodes(face)
+            style.update(faceNodes, time: frame.timestamp)
             guard let layer = renderOverlay(time: frame.timestamp, side: side) else {
                 composed = SignalEffect.lostScreen(
                     extent: CGRect(origin: .zero, size: viewport),
@@ -225,6 +241,12 @@ protocol FaceStyle {
     func makeNodes(device: MTLDevice) -> [StyledNode]
     func backdrop(_ camera: CIImage) -> CIImage
     func finish(_ image: CIImage, time: Double) -> CIImage
+    // Per-frame animation of the style's nodes (materials, offsets).
+    func update(_ nodes: [StyledNode], time: Double)
+}
+
+extension FaceStyle {
+    func update(_ nodes: [StyledNode], time: Double) {}
 }
 
 // "Ghost in the mesh": the face is a dark mask that follows the head and
@@ -267,4 +289,4 @@ struct GhostStyle: FaceStyle {
     }
 }
 
-let allFaceStyles: [FaceStyle] = [GhostStyle()]
+let allFaceStyles: [FaceStyle] = [TextFaceStyle(), GhostStyle()]
