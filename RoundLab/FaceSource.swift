@@ -29,7 +29,6 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
     private var lastTimestamp: TimeInterval?
     private var settleFrames = 0
     private var overlayMs = 0.0
-    private static let staleAfter: CFTimeInterval = 0.05
     private static let settleAfterLoss = 4
 
     init?(output: RoundOutput, style: FaceStyle) {
@@ -98,13 +97,8 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let started = CACurrentMediaTime()
-        // Latest frame wins: a frame that waited behind a slow one is dropped,
-        // so the picture never lags further behind the head.
-        // (Ages over a second mean a different clock: then nothing is dropped.)
-        let age = started - frame.timestamp
-        if age > Self.staleAfter, age < 1 {
-            return
-        }
+        // No age-based dropping: ARKit delivers frames 50+ ms after capture,
+        // and a "stale" cut-off dropped every frame for seconds (2026-10-22).
         overlayMs = 0
         let side = output.side
         let viewport = CGSize(width: side, height: side)

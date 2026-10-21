@@ -63,9 +63,9 @@ def pull():
         [PMD, "apps", "afc", "--documents", BUNDLE],
         input="ls /Documents\nexit\n", capture_output=True, text=True).stdout
     print(listing)
-    for name in listing.split():
+    for name in listing.replace("", "").split():
         if name.endswith((".csv", ".mp4")):
-            run([PMD, "apps", "pull", "--documents", BUNDLE, f"/Documents/{name}", target / name])
+            run([PMD, "apps", "pull", "--documents", BUNDLE, f"/Documents/{name}", target / name], env={**__import__("os").environ, "MSYS_NO_PATHCONV": "1"})
 
 
 if __name__ == "__main__":
