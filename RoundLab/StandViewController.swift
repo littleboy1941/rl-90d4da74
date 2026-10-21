@@ -11,19 +11,42 @@ final class PreviewView: UIView {
     }
 }
 
+// What the FX button cycles through: 3D face styles (ARKit) first,
+// then flat Vision effects.
+enum Mode {
+    case face(FaceStyle)
+    case flat(RoundEffect)
+
+    var name: String {
+        switch self {
+        case .face(let style): return style.name
+        case .flat(let effect): return effect.name
+        }
+    }
+}
+
 final class StandViewController: UIViewController {
-    private let pipeline = RoundPipeline()
+    private let output = RoundOutput()
+    private lazy var visionSource = VisionSource(output: output, effect: allEffects[0])
+    private lazy var faceSource: FaceSource? = FaceSource.isSupported
+        ? FaceSource(output: output, style: allFaceStyles[0])
+        : nil
+    private lazy var modes: [Mode] = (faceSource == nil ? [] : allFaceStyles.map { Mode.face($0) })
+        + allEffects.map { Mode.flat($0) }
+    private var active: FrameSource?
+
     private let preview = PreviewView()
     private let recordButton = UIButton(type: .system)
     private let effectButton = UIButton(type: .system)
     private let statsLabel = UILabel()
     private let fileLabel = UILabel()
-    private var effectIndex = 0
+    private var modeIndex = 0
 
     private var frames = 0
     private var facesFrames = 0
     private var lostFrames = 0
-    private var visionTotal = 0.0
+    private var trackTotal = 0.0
+    private var renderTotal = 0.0
     private var windowStart = CACurrentMediaTime()
 
     override func viewDidLoad() {
@@ -65,7 +88,7 @@ final class StandViewController: UIViewController {
         effectButton.backgroundColor = .darkGray
         effectButton.layer.cornerRadius = 28
         effectButton.translatesAutoresizingMaskIntoConstraints = false
-        effectButton.addTarget(self, action: #selector(nextEffect), for: .touchUpInside)
+        effectButton.addTarget(self, action: #selector(nextMode), for: .touchUpInside)
         view.addSubview(effectButton)
 
         NSLayoutConstraint.activate([
@@ -93,7 +116,7 @@ final class StandViewController: UIViewController {
             fileLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
         ])
 
-        pipeline.onFrame = { [weak self] sample, stats in
+        output.onSample = { [weak self] sample, stats in
             self?.preview.displayLayer.sampleBufferRenderer.enqueue(sample)
             DispatchQueue.main.async {
                 self?.collect(stats)
@@ -117,18 +140,31 @@ final class StandViewController: UIViewController {
             statsLabel.text = "No camera access"
             return
         }
-        do {
-            try pipeline.configure()
-            pipeline.start()
-            statsLabel.text = allEffects[effectIndex].name
-        } catch {
-            statsLabel.text = "Camera error: \(error.localizedDescription)"
-        }
+        apply(modes[modeIndex])
     }
 
-    private func collect(_ stats: RoundPipeline.Stats) {
+    private func apply(_ mode: Mode) {
+        let next: FrameSource?
+        switch mode {
+        case .face(let style):
+            faceSource?.setStyle(style)
+            next = faceSource
+        case .flat(let effect):
+            visionSource.setEffect(effect)
+            next = visionSource
+        }
+        if active !== next {
+            active?.stop()
+            active = next
+            active?.start()
+        }
+        statsLabel.text = mode.name
+    }
+
+    private func collect(_ stats: RoundOutput.Stats) {
         frames += 1
-        visionTotal += stats.visionMs
+        trackTotal += stats.trackMs
+        renderTotal += stats.renderMs
         if stats.faces > 0 {
             facesFrames += 1
         }
@@ -140,31 +176,33 @@ final class StandViewController: UIViewController {
         guard elapsed >= 1 else {
             return
         }
+        let count = Double(max(frames, 1))
         statsLabel.text = String(
-            format: "%@\n%.1f fps · vision %.1f ms\nface %d%% · black %d%%",
-            allEffects[effectIndex].name,
+            format: "%@\n%.1f fps / track %.1f ms / render %.1f ms\nface %d%% / lost %d%%",
+            modes[modeIndex].name,
             Double(frames) / elapsed,
-            visionTotal / Double(max(frames, 1)),
+            trackTotal / count,
+            renderTotal / count,
             facesFrames * 100 / max(frames, 1),
             lostFrames * 100 / max(frames, 1))
         frames = 0
         facesFrames = 0
         lostFrames = 0
-        visionTotal = 0
+        trackTotal = 0
+        renderTotal = 0
         windowStart = now
     }
 
-    @objc private func nextEffect() {
-        effectIndex = (effectIndex + 1) % allEffects.count
-        pipeline.setEffect(allEffects[effectIndex])
-        statsLabel.text = allEffects[effectIndex].name
+    @objc private func nextMode() {
+        modeIndex = (modeIndex + 1) % modes.count
+        apply(modes[modeIndex])
     }
 
     @objc private func toggleRecording() {
-        if pipeline.isRecording {
+        if output.isRecording {
             recordButton.setTitle("REC", for: .normal)
             recordButton.backgroundColor = .systemRed
-            pipeline.stopRecording { [weak self] url in
+            output.stopRecording { [weak self] url in
                 DispatchQueue.main.async {
                     self?.fileLabel.text = url.map { "saved: \($0.lastPathComponent)" } ?? "not saved"
                 }
@@ -172,8 +210,8 @@ final class StandViewController: UIViewController {
         } else {
             recordButton.setTitle("STOP", for: .normal)
             recordButton.backgroundColor = .darkGray
-            fileLabel.text = "recording…"
-            pipeline.startRecording()
+            fileLabel.text = "recording..."
+            output.startRecording()
         }
     }
 }
