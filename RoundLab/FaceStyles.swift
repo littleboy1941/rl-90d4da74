@@ -86,17 +86,17 @@ struct TextFaceStyle: FaceStyle {
     }
 }
 
-// "Leak" (reference 2, Elliot poster): the real face stays visible; one
-// side of it leaks sideways into the dark in ragged horizontal streaks —
-// each band of rows takes the color at the face edge and stretches it out
-// for a random, flickering length. Low-key grade, CRT lines, color fringe
-// and a terminal prompt on top.
+// "Leak" (reference 2, Elliot poster): the real face stays visible, almost
+// blown out to white on black; its left side leaks into the dark in dense
+// horizontal streaks one LED row tall, some rows inside the face slide
+// sideways, and the whole picture is shown as a low-res LED dot matrix.
 struct LeakStyle: FaceStyle {
     let name = "leak"
-    var bandHeight: CGFloat = 3
-    var maxLength: CGFloat = 0.9      // of the face width
-    var emptyShare = 0.3              // bands without a streak
-    var ticksPerSecond = 14.0         // how often streak lengths change
+    var cell: CGFloat = 5             // LED dot pitch in output pixels
+    var maxLength: CGFloat = 1.15     // of the face width
+    var emptyShare = 0.12             // rows without a streak
+    var shiftedShare = 0.08           // rows inside the face slid sideways
+    var ticksPerSecond = 12.0         // how often the streaks change
 
     func makeNodes(device: MTLDevice) -> [StyledNode] {
         // White unlit face: used only as a soft mask for the lighting.
@@ -116,80 +116,135 @@ struct LeakStyle: FaceStyle {
 
     func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage {
         let extent = camera.extent
-        // Low key: everything but the face falls into the dark.
-        let soft = overlay.clampedToExtent().applyingGaussianBlur(sigma: 14).cropped(to: extent)
+        // Hard low key: the face close to white, the rest close to black.
+        let soft = overlay.clampedToExtent().applyingGaussianBlur(sigma: 10).cropped(to: extent)
         let graded = camera.applyingFilter("CIColorControls", parameters: [
-            kCIInputSaturationKey: 0.55,
-            kCIInputContrastKey: 1.15,
+            kCIInputSaturationKey: 0.45,
+            kCIInputContrastKey: 1.5,
+            kCIInputBrightnessKey: 0.03,
         ])
-        let dark = graded.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -2.2])
-        var image = graded.applyingFilter("CIBlendWithAlphaMask", parameters: [
+        let bright = graded.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: 0.45])
+        let dark = graded.applyingFilter("CIExposureAdjust", parameters: [kCIInputEVKey: -2.8])
+        var image = bright.applyingFilter("CIBlendWithAlphaMask", parameters: [
             kCIInputBackgroundImageKey: dark,
             kCIInputMaskImageKey: soft,
         ]).cropped(to: extent)
 
         let bounds = face.bounds
         if !bounds.isNull, bounds.width > 4 {
-            image = Self.streaks(over: image, face: face, bounds: bounds, style: self, time: time)
+            image = streaks(over: image, face: face, bounds: bounds, time: time)
         }
         return finish(image, time: time)
     }
 
-    static func streaks(over image: CIImage, face: FaceShape, bounds: CGRect, style: LeakStyle, time: Double) -> CIImage {
+    func streaks(over image: CIImage, face: FaceShape, bounds: CGRect, time: Double) -> CIImage {
         let extent = image.extent
-        let rows = Int(extent.height / style.bandHeight) + 1
-        var edges = [CGFloat](repeating: .greatestFiniteMagnitude, count: rows)
+        let rows = Int(extent.height / cell) + 1
+        var left = [CGFloat](repeating: .greatestFiniteMagnitude, count: rows)
+        var right = [CGFloat](repeating: -.greatestFiniteMagnitude, count: rows)
         for point in face.points {
-            let row = Int(point.y / style.bandHeight)
+            let row = Int(point.y / cell)
             if row >= 0, row < rows {
-                edges[row] = min(edges[row], point.x)
+                left[row] = min(left[row], point.x)
+                right[row] = max(right[row], point.x)
             }
         }
-        let tick = UInt64(max(0, Int(time * style.ticksPerSecond)))
-        var streaks = CIImage.empty()
-        for row in 0..<rows where edges[row] < .greatestFiniteMagnitude {
+        let tick = UInt64(max(0, Int(time * ticksPerSecond)))
+        var layer = CIImage.empty()
+        for row in 0..<rows where left[row] < .greatestFiniteMagnitude {
             var generator = SplitMix(seed: UInt64(row) &* 7919 &+ tick &* 104_729)
             let roll = Double(generator.next() % 10_000) / 10_000
-            guard roll >= style.emptyShare else {
+            let y = CGFloat(row) * cell
+            let band = CGRect(x: extent.minX, y: y, width: extent.width, height: cell)
+
+            // Some rows inside the face slide sideways (glitch).
+            if roll < shiftedShare {
+                let shift = -cell * CGFloat(2 + generator.next() % 6)
+                let span = CGRect(x: left[row], y: y, width: max(right[row] - left[row], 1), height: cell)
+                let moved = image.cropped(to: span)
+                    .transformed(by: CGAffineTransform(translationX: shift, y: 0))
+                    .cropped(to: band)
+                layer = moved.composited(over: layer)
+            }
+            guard roll >= emptyShare else {
                 continue
             }
-            let strength = (roll - style.emptyShare) / (1 - style.emptyShare)
-            let length = bounds.width * style.maxLength * CGFloat(strength * strength)
-            guard length >= 2 else {
-                continue
-            }
-            let edge = edges[row]
-            let sampleX = floor(min(edge + bounds.width * 0.05, extent.maxX - 1))
-            let y = CGFloat(row) * style.bandHeight
-            let column = image
-                .cropped(to: CGRect(x: sampleX, y: y, width: 1, height: style.bandHeight))
+            // Streak: the color just inside the left edge, stretched out to the left.
+            let strength = (roll - emptyShare) / (1 - emptyShare)
+            let length = bounds.width * maxLength * CGFloat(0.2 + 0.8 * strength)
+            let edge = left[row]
+            let inside = bounds.width * (0.04 + 0.1 * Double(generator.next() % 100) / 100)
+            let sampleX = floor(min(edge + inside, extent.maxX - 1))
+            let streak = image
+                .cropped(to: CGRect(x: sampleX, y: y, width: 1, height: cell))
                 .samplingNearest()
                 .transformed(by: CGAffineTransform(translationX: -sampleX, y: 0))
-                .transformed(by: CGAffineTransform(scaleX: length, y: 1))
+                .transformed(by: CGAffineTransform(scaleX: length + inside, y: 1))
                 .transformed(by: CGAffineTransform(translationX: edge - length, y: 0))
-            streaks = column.composited(over: streaks)
+            // Tips go teal and fade, like the reference.
+            let tip = CGRect(x: edge - length, y: y, width: length * 0.35, height: cell)
+            let teal = streak.cropped(to: tip).applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: 0.35, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: 0.8, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: 0.75, w: 0),
+                "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 0.8),
+            ])
+            layer = teal.composited(over: streak.composited(over: layer))
         }
-        return streaks.composited(over: image).cropped(to: extent)
+        return layer.composited(over: image).cropped(to: extent)
     }
 
     func finish(_ image: CIImage, time: Double) -> CIImage {
         let extent = image.extent
-        // Cold tint, color fringe, CRT lines, vignette, terminal prompt.
-        var result = image.applyingFilter("CIColorMatrix", parameters: [
-            "inputRVector": CIVector(x: 0.92, y: 0, z: 0, w: 0),
-            "inputGVector": CIVector(x: 0, y: 0.97, z: 0, w: 0),
-            "inputBVector": CIVector(x: 0, y: 0, z: 1.06, w: 0),
-        ])
-        result = SignalEffect.colorSplit(result, extent: extent, shift: 1.5)
-        result = SignalEffect.scanlines(extent: extent).composited(over: result)
+        // Faint red fringe, then the LED dot matrix, then the prompt on top.
+        var result = SignalEffect.colorSplit(image, extent: extent, shift: 2)
+        result = Self.ledMatrix(result, extent: extent, cell: cell)
         result = result.applyingFilter("CIVignette", parameters: [
-            kCIInputIntensityKey: 0.9,
-            kCIInputRadiusKey: 1.4,
+            kCIInputIntensityKey: 0.7,
+            kCIInputRadiusKey: 1.5,
         ])
         if let prompt = Self.prompt(extent: extent, time: time) {
             result = prompt.composited(over: result)
         }
         return result.cropped(to: extent)
+    }
+
+    // Low-res picture shown as square LED dots with dark gaps.
+    static func ledMatrix(_ image: CIImage, extent: CGRect, cell: CGFloat) -> CIImage {
+        let blocks = image.applyingFilter("CIPixellate", parameters: [
+            kCIInputCenterKey: CIVector(x: cell / 2, y: cell / 2),
+            kCIInputScaleKey: cell,
+        ])
+        return blocks
+            .applyingFilter("CIMultiplyCompositing", parameters: [
+                kCIInputBackgroundImageKey: dotTile(cell: Int(cell)),
+            ])
+            .cropped(to: extent)
+    }
+
+    // One LED: a rounded bright square with a dark gap around it, tiled.
+    static func dotTile(cell: Int) -> CIImage {
+        let size = CGFloat(cell)
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: size, height: size), format: {
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1
+            format.opaque = true
+            return format
+        }())
+        let image = renderer.image { context in
+            UIColor(white: 0.12, alpha: 1).setFill()
+            context.fill(CGRect(x: 0, y: 0, width: size, height: size))
+            UIColor.white.setFill()
+            UIBezierPath(
+                roundedRect: CGRect(x: 0.5, y: 0.5, width: size - 1.5, height: size - 1.5),
+                cornerRadius: size * 0.2).fill()
+        }
+        guard let cgImage = image.cgImage else {
+            return CIImage(color: .white)
+        }
+        return CIImage(cgImage: cgImage).applyingFilter("CIAffineTile", parameters: [
+            kCIInputTransformKey: NSValue(cgAffineTransform: .identity),
+        ])
     }
 
     // "root@elliot:~# _" near the top of the circle, cursor blinking.
