@@ -1,0 +1,75 @@
+# RoundLab: unsigned IPA (signed on the PC with zsign, installed over USB).
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Compile
+        run: |
+          set -euo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          APP="build/Payload/RoundLab.app"
+          mkdir -p "$APP"
+          xcrun --sdk iphoneos swiftc \
+            -target arm64-apple-ios17.0 \
+            -sdk "$SDK" \
+            -swift-version 5 \
+            -module-name RoundLab \
+            -parse-as-library \
+            -O \
+            RoundLab/*.swift \
+            -o "$APP/RoundLab"
+
+      - name: Bundle
+        run: |
+          set -euo pipefail
+          APP="build/Payload/RoundLab.app"
+          PLIST="$APP/Info.plist"
+          cp RoundLab/Info.plist "$PLIST"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$PLIST"
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          SDK_BUILD="$(xcrun --sdk iphoneos --show-sdk-build-version)"
+          XCODE_VERSION="$(xcodebuild -version | awk 'NR==1{print $2}')"
+          XCODE_BUILD="$(xcodebuild -version | awk 'NR==2{print $3}')"
+          /usr/libexec/PlistBuddy \
+            -c "Add :DTPlatformName string iphoneos" \
+            -c "Add :DTPlatformVersion string $SDK_VERSION" \
+            -c "Add :DTSDKName string iphoneos$SDK_VERSION" \
+            -c "Add :DTSDKBuild string $SDK_BUILD" \
+            -c "Add :DTPlatformBuild string $SDK_BUILD" \
+            -c "Add :DTXcode string $XCODE_VERSION" \
+            -c "Add :DTXcodeBuild string $XCODE_BUILD" \
+            "$PLIST"
+          plutil -convert binary1 "$PLIST"
+          plutil -lint "$PLIST"
+          printf 'APPL????' > "$APP/PkgInfo"
+          cd build
+          zip -qry RoundLab.ipa Payload
+          ls -l RoundLab.ipa
+          shasum -a 256 RoundLab.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RoundLab-ipa
+          path: build/RoundLab.ipa
+          retention-days: 14
