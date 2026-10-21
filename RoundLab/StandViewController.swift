@@ -15,8 +15,10 @@ final class StandViewController: UIViewController {
     private let pipeline = RoundPipeline()
     private let preview = PreviewView()
     private let recordButton = UIButton(type: .system)
+    private let effectButton = UIButton(type: .system)
     private let statsLabel = UILabel()
     private let fileLabel = UILabel()
+    private var effectIndex = 0
 
     private var frames = 0
     private var facesFrames = 0
@@ -57,7 +59,21 @@ final class StandViewController: UIViewController {
         recordButton.addTarget(self, action: #selector(toggleRecording), for: .touchUpInside)
         view.addSubview(recordButton)
 
+        effectButton.setTitle("FX", for: .normal)
+        effectButton.setTitleColor(.white, for: .normal)
+        effectButton.titleLabel?.font = .boldSystemFont(ofSize: 16)
+        effectButton.backgroundColor = .darkGray
+        effectButton.layer.cornerRadius = 28
+        effectButton.translatesAutoresizingMaskIntoConstraints = false
+        effectButton.addTarget(self, action: #selector(nextEffect), for: .touchUpInside)
+        view.addSubview(effectButton)
+
         NSLayoutConstraint.activate([
+            effectButton.centerYAnchor.constraint(equalTo: recordButton.centerYAnchor),
+            effectButton.trailingAnchor.constraint(equalTo: recordButton.leadingAnchor, constant: -32),
+            effectButton.widthAnchor.constraint(equalToConstant: 56),
+            effectButton.heightAnchor.constraint(equalToConstant: 56),
+
             preview.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             preview.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -40),
             preview.widthAnchor.constraint(equalToConstant: 320),
@@ -104,7 +120,7 @@ final class StandViewController: UIViewController {
         do {
             try pipeline.configure()
             pipeline.start()
-            statsLabel.text = "effect: \(pipeline.effect.name)"
+            statsLabel.text = allEffects[effectIndex].name
         } catch {
             statsLabel.text = "Camera error: \(error.localizedDescription)"
         }
@@ -126,7 +142,7 @@ final class StandViewController: UIViewController {
         }
         statsLabel.text = String(
             format: "%@\n%.1f fps · vision %.1f ms\nface %d%% · black %d%%",
-            pipeline.effect.name,
+            allEffects[effectIndex].name,
             Double(frames) / elapsed,
             visionTotal / Double(max(frames, 1)),
             facesFrames * 100 / max(frames, 1),
@@ -136,6 +152,12 @@ final class StandViewController: UIViewController {
         lostFrames = 0
         visionTotal = 0
         windowStart = now
+    }
+
+    @objc private func nextEffect() {
+        effectIndex = (effectIndex + 1) % allEffects.count
+        pipeline.setEffect(allEffects[effectIndex])
+        statsLabel.text = allEffects[effectIndex].name
     }
 
     @objc private func toggleRecording() {

@@ -19,7 +19,7 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     let session = AVCaptureSession()
     let side = 400
-    var effect: RoundEffect = BlackOvalEffect()
+    var effect: RoundEffect = allEffects[0]
     var holdSeconds: CFTimeInterval = 0.5
 
     // Called on the video queue.
@@ -32,7 +32,7 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
     private let sequenceHandler = VNSequenceRequestHandler()
     private var pool: CVPixelBufferPool?
     private var lastPresentation: CMTime?
-    private var lastFaces: [CGRect] = []
+    private var lastFaces: [Face] = []
     private var lastFaceTime: CFTimeInterval = -1
     private var writer: RoundWriter?
     private let log = FrameLog()
@@ -62,15 +62,8 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         if session.canAddOutput(output) {
             session.addOutput(output)
         }
-        if let connection = output.connection(with: .video) {
-            if connection.isVideoRotationAngleSupported(90) {
-                connection.videoRotationAngle = 90
-            }
-            if connection.isVideoMirroringSupported {
-                connection.automaticallyAdjustsVideoMirroring = false
-                connection.isVideoMirrored = true
-            }
-        }
+        // Buffers stay in the sensor orientation (landscape); the pipeline
+        // rotates and mirrors them itself, like Telegram's round video filter.
         if (try? device.lockForConfiguration()) != nil {
             let frame = CMTime(value: 1, timescale: 30)
             let ranges = device.activeFormat.videoSupportedFrameRateRanges
@@ -87,6 +80,12 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
             if !session.isRunning {
                 session.startRunning()
             }
+        }
+    }
+
+    func setEffect(_ next: RoundEffect) {
+        queue.async { [self] in
+            effect = next
         }
     }
 
@@ -126,17 +125,29 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let intervalMs = lastPresentation.map { (presentation - $0).seconds * 1000 } ?? 0
         lastPresentation = presentation
 
-        let width = CVPixelBufferGetWidth(pixels)
-        let height = CVPixelBufferGetHeight(pixels)
+        // Front camera, portrait: the sensor buffer is landscape; rotate it
+        // upright and mirror it like a selfie preview.
+        var source = CIImage(cvPixelBuffer: pixels)
+        if source.extent.width > source.extent.height {
+            source = source.oriented(.leftMirrored)
+        }
+        source = source.transformed(by: CGAffineTransform(
+            translationX: -source.extent.minX,
+            y: -source.extent.minY))
+        let width = Int(source.extent.width)
+        let height = Int(source.extent.height)
+        let size = CGSize(width: width, height: height)
 
         let visionStart = CACurrentMediaTime()
-        var faces: [CGRect] = []
+        var faces: [Face] = []
         var visionFailed = false
-        let request = VNDetectFaceRectanglesRequest()
+        let request = VNDetectFaceLandmarksRequest()
         do {
-            try sequenceHandler.perform([request], on: pixels, orientation: .up)
-            faces = (request.results ?? []).map {
-                VNImageRectForNormalizedRect($0.boundingBox, width, height)
+            try sequenceHandler.perform([request], on: source, orientation: .up)
+            faces = (request.results ?? []).map { observation in
+                Face(
+                    rect: VNImageRectForNormalizedRect(observation.boundingBox, width, height),
+                    contour: observation.landmarks?.faceContour?.pointsInImage(imageSize: size) ?? [])
             }
         } catch {
             visionFailed = true
@@ -153,7 +164,6 @@ final class RoundPipeline: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         let used = faces.isEmpty ? (held ? lastFaces : []) : faces
         let lost = visionFailed || used.isEmpty
 
-        let source = CIImage(cvPixelBuffer: pixels)
         let processed = effect.apply(to: source, faces: used, trackingLost: lost)
         let square = min(width, height)
         let crop = CGRect(
