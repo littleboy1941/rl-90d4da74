@@ -405,4 +405,5 @@ struct BlurEffect: RoundEffect {
     }
 }
 
-let allEffects: [RoundEffect] = [BlurEffect(), TVStaticBodyEffect(), ScribbleEffect(), SignalEffect(), BlackSilhouetteEffect(), BlackOvalEffect()]
+let allEffects: [RoundEffect] = [
+    BlurEffect(), TVStaticBodyEffect.fast, TVStaticBodyEffect.accurate, TVStaticBodyEffect.smooth, ScribbleEffect(), SignalEffect(), BlackSilhouetteEffect(), BlackOvalEffect()]

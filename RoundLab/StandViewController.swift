@@ -38,7 +38,9 @@ enum Mode {
 
     static let titles = [
         "blur": "Размытие лиц",
-        "tv_static_body": "ТВ-шум на всё тело",
+        "tv_static_body": "ТВ-шум на всё тело · быстро",
+        "tv_static_body_hq": "ТВ-шум на всё тело · точно",
+        "tv_static_body_39": "ТВ-шум на всё тело · как в 39",
         "tv_static": "ТВ-шум на лице",
         "scribble": "Зачёркнуто (маркер)",
         "smear": "Smear (стекание)",
