@@ -31,6 +31,17 @@ jobs:
       - name: Ensure iOS platform (actool for the app icon)
         run: xcrun simctl list runtimes | grep -q 'iOS' || xcodebuild -downloadPlatform iOS
 
+      - name: Check Metal shaders
+        run: |
+          set -euo pipefail
+          # Shaders are compiled on the device from Swift strings; a typo there
+          # silently disables the effect, so compile every one here first.
+          python3 tools/check_shaders.py RoundLab build/shaders
+          for f in build/shaders/*.metal; do
+            echo "== $f"
+            xcrun -sdk iphoneos metal -std=metal3.0 -c "$f" -o "${f%.metal}.air"
+          done
+
       - name: Compile
         run: |
           set -euo pipefail

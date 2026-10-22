@@ -279,7 +279,8 @@ struct MeltStyle: FaceStyle {
         let extent = camera.extent
         let epoch = Int(time / epochSeconds)
         let columns = meltColumns(face: face.bounds, extent: extent, epoch: epoch)
-        return MeltGPU.shared.run(camera, columns: columns, block: block, epoch: epoch, time: time) ?? camera
+        return MeltGPU.shared.run(camera, columns: columns, block: block, epoch: epoch, time: time)
+            ?? camera.applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: 24]).cropped(to: extent)
     }
 
     func finish(_ image: CIImage, time: Double) -> CIImage {
@@ -329,6 +330,191 @@ struct MeltStyle: FaceStyle {
     }
 }
 
+// "Acid" (author's reference 5, psychedelic glitch portrait): brightness is
+// mapped to a cycling rainbow, so smooth skin breaks into blue / cyan /
+// green zones with dark contours and the iris turns into rings; amplified
+// local contrast becomes colored grain, blacks are crushed. The hair runs
+// down in rainbow streaks (MeltGPU bands, stopping at the eyes), the area
+// around the face ripples in wavy horizontal lines, and dark red veins
+// creep down from the right eye. Same feedback pass as `melt`.
+struct AcidStyle: FaceStyle {
+    let name = "acid"
+    var block: Float = 4
+    var epochSeconds = 2.5
+
+    func makeNodes(device: MTLDevice) -> [StyledNode] {
+        []
+    }
+
+    func backdrop(_ camera: CIImage) -> CIImage {
+        camera
+    }
+
+    func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage {
+        let extent = camera.extent
+        let epoch = Int(time / epochSeconds)
+        let columns = hairColumns(face: face.bounds, extent: extent, epoch: epoch)
+        // Shader missing (compile error on the device): never show the bare face.
+        return MeltGPU.acid.run(
+            camera, columns: columns, block: block, epoch: epoch, time: time, face: face.bounds)
+            ?? camera.applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: 24]).cropped(to: extent)
+    }
+
+    func finish(_ image: CIImage, time: Double) -> CIImage {
+        image
+    }
+
+    // Streaking bands over the head only; the shader stops them at the eyes.
+    func hairColumns(face: CGRect, extent: CGRect, epoch: Int) -> [MeltColumn] {
+        let count = Int(ceil(Float(extent.width) / block))
+        var columns = [MeltColumn](repeating: MeltColumn(), count: count)
+        guard !face.isNull, face.width > 4 else {
+            return columns
+        }
+        var generator = SplitMix(seed: UInt64(max(epoch, 0)) &* 6151 &+ 5)
+        let left = Float(face.minX - face.width * 0.35)
+        let right = Float(face.maxX + face.width * 0.35)
+        let faceTop = Float(extent.height - face.maxY)
+        let faceHeight = Float(face.height)
+        var index = 0
+        while index < count {
+            let width = 1 + Int(generator.next() % 4)
+            let center = (Float(index) + Float(width) / 2) * block
+            var column = MeltColumn()
+            if center > left, center < right, generator.next() % 10 < 8 {
+                column.top = faceTop - faceHeight * (0.1 + 0.5 * Float(generator.next() % 100) / 100)
+                column.speed = Float(2 + generator.next() % 4)
+                column.refresh = 0.02
+            }
+            column.band = Float(index)
+            for i in index..<min(index + width, count) {
+                columns[i] = column
+            }
+            index += width
+        }
+        return columns
+    }
+}
+
+enum AcidShader {
+    static let source = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    struct Column { float top; float speed; float refresh; float band; };
+    struct Params { float width; float height; float block; uint columns; uint frame; uint keyframe;
+                    float faceX; float faceY; float faceW; float faceH; float time; };
+
+    static float hash3(uint a, uint b, uint c) {
+        uint h = a * 73856093u ^ b * 19349663u ^ c * 83492791u;
+        h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+        return float(h & 0xffffffu) / 16777216.0;
+    }
+
+    static float vnoise(float2 p) {
+        float2 i = floor(p);
+        float2 f = fract(p);
+        f = f * f * (3.0 - 2.0 * f);
+        uint x = uint(int(i.x) + 4096);
+        uint y = uint(int(i.y) + 4096);
+        float a = hash3(x, y, 7u), b = hash3(x + 1u, y, 7u);
+        float c = hash3(x, y + 1u, 7u), d = hash3(x + 1u, y + 1u, 7u);
+        return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+    }
+
+    static float3 hsv2rgb(float3 c) {
+        float3 p = abs(fract(c.xxx + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0);
+        return c.z * mix(float3(1.0), saturate(p - 1.0), c.y);
+    }
+
+    static float luma(texture2d<float, access::read> cam, int2 p, int w, int h) {
+        p = clamp(p, int2(0), int2(w - 1, h - 1));
+        return dot(cam.read(uint2(p)).rgb, float3(0.299, 0.587, 0.114));
+    }
+
+    // Texture coordinates (y bottom up) in, false-color pixel out.
+    static float3 acid(texture2d<float, access::read> cam, int2 p, float sy, constant Params &prm) {
+        int w = int(prm.width);
+        int h = int(prm.height);
+        float t = prm.time;
+        bool face = prm.faceW > 4.0;
+        float cx = prm.faceX + prm.faceW * 0.5;
+        float cy = prm.faceY + prm.faceH * 0.5;
+        // 0 inside the face oval, 1 well outside it.
+        float2 d = face ? (float2(float(p.x), sy) - float2(cx, cy)) / float2(prm.faceW * 0.6, prm.faceH * 0.65)
+                        : float2(2.0);
+        float outside = smoothstep(0.9, 1.4, length(d));
+
+        // Wavy horizontal lines around the face.
+        float wave = sin(sy * 0.21 + t * 3.0 + 2.0 * sin(float(p.x) * 0.03 + t)) * 5.0 * outside;
+        int2 q = int2(p.x + int(wave), p.y);
+
+        float l = luma(cam, q, w, h);
+        float n4 = (luma(cam, q + int2(2, 0), w, h) + luma(cam, q - int2(2, 0), w, h)
+                  + luma(cam, q + int2(0, 2), w, h) + luma(cam, q - int2(0, 2), w, h)) * 0.25;
+        float detail = l + (l - n4) * (2.5 + 2.0 * outside);       // grain from noise
+        float3 rgb = cam.read(uint2(clamp(q, int2(0), int2(w - 1, h - 1)))).rgb;
+        float origHue = atan2(1.732 * (rgb.g - rgb.b), 2.0 * rgb.r - rgb.g - rgb.b) / 6.2832 + 0.5;
+
+        float hue = fract(detail * 2.3 + origHue * 0.35 + t * 0.07);
+        float value = smoothstep(0.06, 0.45, detail);
+        float3 c = hsv2rgb(float3(hue, 1.0, value));
+
+        // Dark contours where the brightness changes fast.
+        float gx = luma(cam, q + int2(1, 0), w, h) - luma(cam, q - int2(1, 0), w, h);
+        float gy = luma(cam, q + int2(0, 1), w, h) - luma(cam, q - int2(0, 1), w, h);
+        float edge = smoothstep(0.08, 0.2, abs(gx) + abs(gy));
+        c *= 1.0 - 0.8 * edge;
+
+        // Red veins from the right eye (on screen) down the cheek.
+        if (face) {
+            float ex = prm.faceX + prm.faceW * 0.7;
+            float ey = prm.faceY + prm.faceH * 0.4;
+            float2 e = (float2(float(p.x), sy) - float2(ex, ey)) / prm.faceW;
+            float around = 1.0 - smoothstep(0.12, 0.22, length(e));
+            float below = (1.0 - smoothstep(0.1, 0.2, abs(e.x))) * step(0.0, e.y)
+                        * (1.0 - smoothstep(0.35, 0.6, e.y));
+            float mask = max(around, below);
+            if (mask > 0.0) {
+                float2 v = float2(float(p.x) * 0.09, (sy - t * 6.0) * 0.035);
+                float r = vnoise(v) * 0.65 + vnoise(v * 2.3) * 0.35;
+                float line = 1.0 - smoothstep(0.0, 0.05, abs(r - 0.5));
+                c = mix(c, float3(0.6, 0.02, 0.06), line * mask);
+            }
+        }
+        return c;
+    }
+
+    kernel void acid(texture2d<float, access::read> cam [[texture(0)]],
+                     texture2d<float, access::read> prev [[texture(1)]],
+                     texture2d<float, access::write> dst [[texture(2)]],
+                     constant Column *cols [[buffer(0)]],
+                     constant Params &prm [[buffer(1)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) {
+            return;
+        }
+        int h = int(prm.height);
+        float sy = prm.height - 1.0 - float(gid.y);
+        uint bx = uint(float(gid.x) / prm.block);
+        uint by = uint(sy / prm.block);
+        Column col = cols[min(bx, prm.columns - 1u)];
+        float stop = prm.faceY + prm.faceH * 0.38;                 // streaks end at the eyes
+        bool zone = col.speed > 0.0 && sy > col.top && sy < stop;
+        bool refresh = prm.keyframe != 0u || !zone
+            || hash3(uint(col.band), by / 4u, prm.frame) < col.refresh;
+        float3 c;
+        if (refresh) {
+            c = acid(cam, int2(gid), sy, prm);
+        } else {
+            int py = min(int(gid.y) + int(col.speed), h - 1);
+            c = prev.read(uint2(gid.x, uint(py))).rgb;
+        }
+        dst.write(float4(c, 1.0), gid);
+    }
+    """
+}
+
 // Same memory layout as `Column` in MeltGPU's Metal source (4 floats).
 struct MeltColumn {
     var top: Float = 0
@@ -340,9 +526,11 @@ struct MeltColumn {
 // One compute pass with feedback: reads the camera and the previous output,
 // writes the next output. Three output textures in a ring, so the one Core
 // Image is still showing is never the one being written. Texture rows
-// follow Core Image rows (bottom up), as in LeakGPU.
+// follow Core Image rows (bottom up), as in LeakGPU. One instance per
+// kernel: `melt` and `acid` share the ring, the bands and the Params layout.
 final class MeltGPU {
-    static let shared = MeltGPU()
+    static let shared = MeltGPU(function: "melt", shader: MeltGPU.shader, saturation: 0.55)
+    static let acid = MeltGPU(function: "acid", shader: AcidShader.source, saturation: 1.3)
 
     private struct Params {
         var width: Float
@@ -351,6 +539,11 @@ final class MeltGPU {
         var columns: UInt32
         var frame: UInt32
         var keyframe: UInt32
+        var faceX: Float                // face box, screen pixels (top down)
+        var faceY: Float
+        var faceW: Float
+        var faceH: Float
+        var time: Float
     }
 
     private let device: MTLDevice?
@@ -363,22 +556,25 @@ final class MeltGPU {
     private var frame: UInt32 = 0
     private var lastEpoch = -1
     private var lastTime = 0.0
+    private let saturation: Double
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
-    private init() {
+    private init(function name: String, shader: String, saturation: Double) {
+        self.saturation = saturation
         device = MTLCreateSystemDefaultDevice()
         queue = device?.makeCommandQueue()
         context = device.map { CIContext(mtlDevice: $0, options: [.cacheIntermediates: false]) }
         if let device,
-           let library = try? device.makeLibrary(source: Self.shader, options: nil),
-           let function = library.makeFunction(name: "melt") {
+           let library = try? device.makeLibrary(source: shader, options: nil),
+           let function = library.makeFunction(name: name) {
             pipeline = try? device.makeComputePipelineState(function: function)
         } else {
             pipeline = nil
         }
     }
 
-    func run(_ image: CIImage, columns: [MeltColumn], block: Float, epoch: Int, time: Double) -> CIImage? {
+    func run(_ image: CIImage, columns: [MeltColumn], block: Float, epoch: Int, time: Double,
+             face: CGRect = .null) -> CIImage? {
         let width = Int(image.extent.width)
         let height = Int(image.extent.height)
         guard let device, let queue, let pipeline, let context, !columns.isEmpty, width > 0, height > 0 else {
@@ -405,7 +601,7 @@ final class MeltGPU {
         let target = ring[current]
         frame &+= 1
         let graded = image.applyingFilter("CIColorControls", parameters: [
-            kCIInputSaturationKey: 0.55,
+            kCIInputSaturationKey: saturation,
             kCIInputContrastKey: 1.12,
         ])
         context.render(
@@ -417,9 +613,14 @@ final class MeltGPU {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
             return nil
         }
+        // Face box in screen pixels (Core Image y is bottom up).
+        let box = face.isNull ? CGRect.zero : face
         var params = Params(
             width: Float(width), height: Float(height), block: block,
-            columns: UInt32(columns.count), frame: frame, keyframe: keyframe ? 1 : 0)
+            columns: UInt32(columns.count), frame: frame, keyframe: keyframe ? 1 : 0,
+            faceX: Float(box.minX), faceY: Float(CGFloat(height) - box.maxY),
+            faceW: Float(box.width), faceH: Float(box.height),
+            time: Float(time.truncatingRemainder(dividingBy: 1000)))
         encoder.setComputePipelineState(pipeline)
         encoder.setTexture(source, index: 0)
         encoder.setTexture(previous, index: 1)
@@ -445,7 +646,8 @@ final class MeltGPU {
     using namespace metal;
 
     struct Column { float top; float speed; float refresh; float band; };
-    struct Params { float width; float height; float block; uint columns; uint frame; uint keyframe; };
+    struct Params { float width; float height; float block; uint columns; uint frame; uint keyframe;
+                    float faceX; float faceY; float faceW; float faceH; float time; };
 
     static float hash3(uint a, uint b, uint c) {
         uint h = a * 73856093u ^ b * 19349663u ^ c * 83492791u;
