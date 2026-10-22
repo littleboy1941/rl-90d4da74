@@ -254,8 +254,8 @@ struct SwirlStyle: FaceStyle {
 // down in vertical bands of block width, like repeated P-frames with a
 // downward motion vector. Under each band's start line every pixel copies
 // the previous output from a few pixels above, so the line above keeps
-// streaming down; a few blocks per frame refresh from the camera and then
-// fall too (block steps inside the drips). Fresh pixels get block chroma
+// streaming down; now and then a whole band-wide chunk (16 px tall)
+// refreshes from the camera and falls too (block steps inside the drips). Fresh pixels get block chroma
 // (8 px), a mauve grade and rare pink / acid-green chroma errors; dragged
 // pixels pick up speckle that streaks into fine vertical lines. Bands over
 // the face and hair melt from the forehead / eyes down; the background
@@ -312,13 +312,14 @@ struct MeltStyle: FaceStyle {
                 if Double(unit()) < faceMeltShare {
                     column.top = faceTop - 0.15 * faceHeight + unit() * 0.6 * faceHeight
                     column.speed = Float(1 + generator.next() % 4)
-                    column.refresh = 0.012
+                    column.refresh = 0.006
                 }
             } else if Double(unit()) < backgroundMeltShare {
                 column.top = height * (0.15 + 0.75 * unit())
                 column.speed = Float(1 + generator.next() % 3)
-                column.refresh = 0.04
+                column.refresh = 0.01
             }
+            column.band = Float(index)
             for i in index..<min(index + width, count) {
                 columns[i] = column
             }
@@ -333,7 +334,7 @@ struct MeltColumn {
     var top: Float = 0
     var speed: Float = 0
     var refresh: Float = 1
-    var pad: Float = 0
+    var band: Float = 0               // first block column of the band
 }
 
 // One compute pass with feedback: reads the camera and the previous output,
@@ -404,7 +405,7 @@ final class MeltGPU {
         let target = ring[current]
         frame &+= 1
         let graded = image.applyingFilter("CIColorControls", parameters: [
-            kCIInputSaturationKey: 0.75,
+            kCIInputSaturationKey: 0.55,
             kCIInputContrastKey: 1.12,
         ])
         context.render(
@@ -443,7 +444,7 @@ final class MeltGPU {
     #include <metal_stdlib>
     using namespace metal;
 
-    struct Column { float top; float speed; float refresh; float pad; };
+    struct Column { float top; float speed; float refresh; float band; };
     struct Params { float width; float height; float block; uint columns; uint frame; uint keyframe; };
 
     static float hash3(uint a, uint b, uint c) {
@@ -465,8 +466,8 @@ final class MeltGPU {
         float3 chroma = cam.read(uint2(q)).rgb;
         float y = dot(rgb, float3(0.299, 0.587, 0.114));
         float cy = dot(chroma, float3(0.299, 0.587, 0.114));
-        float cb = (chroma.b - cy) * 0.564 * 0.8 + 0.012;
-        float cr = (chroma.r - cy) * 0.713 * 0.8 + 0.03;
+        float cb = (chroma.b - cy) * 0.564 * 0.8 + 0.02;
+        float cr = (chroma.r - cy) * 0.713 * 0.8 + 0.045;
         float e = hash3(bx / 2u, by / 2u, prm.frame / 20u);
         if (e > 0.9975) { cb = 0.06; cr = 0.2; }            // pink
         else if (e > 0.995) { cb = -0.22; cr = -0.08; }     // acid green
@@ -489,7 +490,8 @@ final class MeltGPU {
         uint by = uint(sy / prm.block);
         Column col = cols[min(bx, prm.columns - 1u)];
         bool zone = col.speed > 0.0 && sy > col.top;
-        bool refresh = prm.keyframe != 0u || !zone || hash3(bx, by, prm.frame) < col.refresh;
+        bool refresh = prm.keyframe != 0u || !zone
+            || hash3(uint(col.band), by / 4u, prm.frame) < col.refresh;
         float3 c;
         if (refresh) {
             c = fresh(cam, gid, bx, by, prm);
