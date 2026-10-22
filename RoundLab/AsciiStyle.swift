@@ -21,6 +21,8 @@ struct AsciiStyle: FaceStyle {
 
     let palette: Palette
     var scrollPerSecond: Float = 6           // characters per second
+    var meshScale: Float = 1.08              // mask mesh around the head origin
+    var maskGrow: CGFloat = 0.06             // mask dilation, of the face width
 
     var name: String {
         palette == .robot ? "ascii_robot" : "ascii_lain"
@@ -35,7 +37,9 @@ struct AsciiStyle: FaceStyle {
         material.diffuse.contents = UIColor.white
         material.lightingModel = .constant
         mesh.firstMaterial = material
-        return [StyledNode(node: SCNNode(geometry: mesh), scale: 1.0)]
+        // The ARKit mesh stops short of the cheek sides, temples and under the
+        // chin; a slightly larger mesh reaches them.
+        return [StyledNode(node: SCNNode(geometry: mesh), scale: meshScale)]
     }
 
     func backdrop(_ camera: CIImage) -> CIImage {
@@ -48,8 +52,14 @@ struct AsciiStyle: FaceStyle {
         let text = AsciiGPU.shared.run(camera, face: face.bounds, palette: palette,
                                        scroll: Float(time) * scrollPerSecond)
             ?? camera.applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: 24]).cropped(to: extent)
-        // Mesh alpha, edge softened by ~1.5 px, picks text over the live frame.
-        let mask = overlay.clampedToExtent().applyingGaussianBlur(sigma: 1.5).cropped(to: extent)
+        // Mesh alpha, grown outward (gaps at the edges while turning), edge
+        // softened by ~1.5 px, picks text over the live frame.
+        let bounds = face.bounds
+        let grow = bounds.isNull ? 0 : bounds.width * maskGrow
+        let mask = overlay.clampedToExtent()
+            .applyingFilter("CIMorphologyMaximum", parameters: [kCIInputRadiusKey: grow])
+            .applyingGaussianBlur(sigma: 1.5)
+            .cropped(to: extent)
         return text.applyingFilter("CIBlendWithAlphaMask", parameters: [
             kCIInputBackgroundImageKey: camera,
             kCIInputMaskImageKey: mask,
