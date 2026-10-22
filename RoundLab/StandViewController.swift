@@ -38,6 +38,7 @@ enum Mode {
 
     static let titles = [
         "blur": "Размытие лиц",
+        "tv_static": "ТВ-шум на лице",
         "scribble": "Зачёркнуто (маркер)",
         "smear": "Smear (стекание)",
         "ascii_robot": "ASCII · Mr. Robot",
@@ -108,7 +109,7 @@ final class StandViewController: UIViewController {
         fileLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(fileLabel)
         // Start on the effect being tested (falls back to the first mode).
-        modeIndex = modes.firstIndex { $0.name == "scribble" } ?? 0
+        modeIndex = modes.firstIndex { $0.name == "tv_static" } ?? 0
 
         // Which TestFlight build is on the phone (CFBundleVersion = CI run number).
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"

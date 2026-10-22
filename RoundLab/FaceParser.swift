@@ -6,10 +6,11 @@ import QuartzCore
 // Per-frame face mask from a face-parsing network (YOLO26-nano, 19 classes,
 // CelebAMask-HQ; Models/FaceParsing.mlpackage, compiled into the app by CI).
 // Unlike the ARKit mesh, the mask comes from the very frame it is applied
-// to, so it does not lag behind fast head turns. Mask = the whole head:
-// face parts plus ears, hair, hat (no neck, clothes) - the edge then runs
-// along the head outline against the background, which the network sees
-// far more surely than the forehead/hair line. Soft edge from the summed
+// to, so it does not lag behind fast head turns. Default mask = the whole
+// head: face parts plus ears, hair, hat (no neck, clothes) - the edge then
+// runs along the head outline against the background, which the network
+// sees far more surely than the forehead/hair line; `skinClasses` = the
+// face alone (tv_static). Soft edge from the summed
 // class probabilities, steadied over frames (see `stabilize`).
 final class FaceParser {
     static let shared = FaceParser()
@@ -17,6 +18,7 @@ final class FaceParser {
     static let grid = 64                        // logits grid
     static let cropScale: CGFloat = 2.0         // crop side, of the face box (hair fits)
     static let faceClasses: Set<Int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    static let skinClasses: Set<Int> = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12]   // face only: no ears, hair, hat
     static let keep: Float = 0.45               // share of the previous frame in the average
     static let enter: Float = 0.6               // a cell joins the mask above this...
     static let leave: Float = 0.4               // ...and leaves it below this
@@ -49,7 +51,7 @@ final class FaceParser {
     // With a face box the network sees a square crop around the face
     // (as in its training set, CelebAMask-HQ): ~2x more grid cells on the
     // face than the whole frame, so a finer, steadier contour.
-    func faceMask(_ image: CIImage, around face: CGRect = .null) -> CIImage? {
+    func faceMask(_ image: CIImage, around face: CGRect = .null, classes: Set<Int> = faceClasses) -> CIImage? {
         guard let model, let input else {
             return nil
         }
@@ -78,7 +80,7 @@ final class FaceParser {
               let logits = output.featureValue(for: "logits")?.multiArrayValue else {
             return nil
         }
-        let probability = stabilize(Self.faceProbability(logits), crop: crop)
+        let probability = stabilize(Self.faceProbability(logits, classes: classes), crop: crop)
         guard let small = Self.grayImage(probability, side: Self.grid) else {
             return nil
         }
@@ -137,7 +139,7 @@ final class FaceParser {
 
     // Softmax over the 19 classes per cell, summed over the face classes;
     // row 0 = top of the frame.
-    static func faceProbability(_ logits: MLMultiArray) -> [UInt8] {
+    static func faceProbability(_ logits: MLMultiArray, classes faceClasses: Set<Int>) -> [UInt8] {
         let classes = 19
         let cells = grid * grid
         var values = [Float](repeating: 0, count: classes * cells)
