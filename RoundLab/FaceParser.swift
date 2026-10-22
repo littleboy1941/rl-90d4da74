@@ -82,7 +82,7 @@ final class FaceParser {
         var values = [Float](repeating: 0, count: classes * cells)
         // Direct buffer reads (NSNumber subscripts would cost milliseconds).
         let strides = logits.strides.map { $0.intValue }
-        func gather<T>(_ type: T.Type, _ convert: (T) -> Float) {
+        func gather<T: MLShapedArrayScalar>(_ type: T.Type, _ convert: (T) -> Float) {
             logits.withUnsafeBufferPointer(ofType: type) { buffer in
                 for c in 0..<classes {
                     for y in 0..<grid {
