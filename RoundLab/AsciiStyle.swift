@@ -122,7 +122,8 @@ final class AsciiGPU {
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
     private init() {
-        device = MTLCreateSystemDefaultDevice()
+        let metal = MTLCreateSystemDefaultDevice()
+        device = metal
         queue = device?.makeCommandQueue()
         context = device.map { CIContext(mtlDevice: $0, options: [.cacheIntermediates: false]) }
         if let device,
@@ -132,9 +133,9 @@ final class AsciiGPU {
         } else {
             pipeline = nil
         }
-        atlas = device.flatMap(Self.makeAtlas)
+        atlas = metal.flatMap(Self.makeAtlas)
         stream = AsciiStyle.stream.withUnsafeBytes { bytes in
-            device?.makeBuffer(bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared)
+            metal?.makeBuffer(bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared)
         }
     }
 
