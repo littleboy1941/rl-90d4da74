@@ -213,6 +213,43 @@ struct LeakStyle: FaceStyle {
     }
 }
 
+// "Mr. Swirl": the Photoshop Twirl look from the 2007 Interpol case - a
+// strong whirlpool centered on the face, the rest of the frame untouched.
+// Core Image's twirl keeps the same graph every frame; only the center,
+// radius and angle change. A plain twirl can be undone (that is how the
+// 2007 photos were unswirled), so this is a look, not anonymization.
+struct SwirlStyle: FaceStyle {
+    let name = "mr_swirl"
+    var turns: Double = 1.6           // full turns at the center
+    var reach: CGFloat = 0.62         // radius as a share of the larger face side
+
+    func makeNodes(device: MTLDevice) -> [StyledNode] {
+        []
+    }
+
+    func backdrop(_ camera: CIImage) -> CIImage {
+        camera
+    }
+
+    func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage {
+        let extent = camera.extent
+        let bounds = face.bounds
+        guard !bounds.isNull, bounds.width > 4 else {
+            return camera
+        }
+        let swirled = camera.clampedToExtent().applyingFilter("CITwirlDistortion", parameters: [
+            kCIInputCenterKey: CIVector(x: bounds.midX, y: bounds.midY),
+            kCIInputRadiusKey: max(bounds.width, bounds.height) * reach,
+            kCIInputAngleKey: turns * 2 * Double.pi,
+        ])
+        return finish(swirled.cropped(to: extent), time: time)
+    }
+
+    func finish(_ image: CIImage, time: Double) -> CIImage {
+        image
+    }
+}
+
 // Same memory layout as `Row` in LeakGPU's Metal source (6 floats).
 struct LeakRow {
     var edge: Float = 0

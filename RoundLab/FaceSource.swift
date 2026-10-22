@@ -346,4 +346,4 @@ struct GhostStyle: FaceStyle {
     }
 }
 
-let allFaceStyles: [FaceStyle] = [LeakStyle(), TextFaceStyle(), GhostStyle()]
+let allFaceStyles: [FaceStyle] = [SwirlStyle(), LeakStyle(), TextFaceStyle(), GhostStyle()]
