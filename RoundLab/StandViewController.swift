@@ -38,6 +38,7 @@ final class StandViewController: UIViewController {
     private let preview = PreviewView()
     private let recordButton = UIButton(type: .system)
     private let effectButton = UIButton(type: .system)
+    private let shareButton = UIButton(type: .system)
     private let statsLabel = UILabel()
     private let fileLabel = UILabel()
     private var modeIndex = 0
@@ -91,11 +92,25 @@ final class StandViewController: UIViewController {
         effectButton.addTarget(self, action: #selector(nextMode), for: .touchUpInside)
         view.addSubview(effectButton)
 
+        shareButton.setTitle("LOG", for: .normal)
+        shareButton.setTitleColor(.white, for: .normal)
+        shareButton.titleLabel?.font = .boldSystemFont(ofSize: 14)
+        shareButton.backgroundColor = .darkGray
+        shareButton.layer.cornerRadius = 28
+        shareButton.translatesAutoresizingMaskIntoConstraints = false
+        shareButton.addTarget(self, action: #selector(shareLogs), for: .touchUpInside)
+        view.addSubview(shareButton)
+
         NSLayoutConstraint.activate([
             effectButton.centerYAnchor.constraint(equalTo: recordButton.centerYAnchor),
             effectButton.trailingAnchor.constraint(equalTo: recordButton.leadingAnchor, constant: -32),
             effectButton.widthAnchor.constraint(equalToConstant: 56),
             effectButton.heightAnchor.constraint(equalToConstant: 56),
+
+            shareButton.centerYAnchor.constraint(equalTo: recordButton.centerYAnchor),
+            shareButton.leadingAnchor.constraint(equalTo: recordButton.trailingAnchor, constant: 32),
+            shareButton.widthAnchor.constraint(equalToConstant: 56),
+            shareButton.heightAnchor.constraint(equalToConstant: 56),
 
             preview.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             preview.centerYAnchor.constraint(equalTo: view.centerYAnchor, constant: -40),
@@ -196,6 +211,23 @@ final class StandViewController: UIViewController {
     @objc private func nextMode() {
         modeIndex = (modeIndex + 1) % modes.count
         apply(modes[modeIndex])
+    }
+
+    // Newest CSV and newest MP4 from Documents, for sending without USB.
+    @objc private func shareLogs() {
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: FrameLog.documents, includingPropertiesForKeys: nil)) ?? []
+        let newest = ["csv", "mp4"].compactMap { ext in
+            files.filter { $0.pathExtension == ext }
+                .max { $0.lastPathComponent < $1.lastPathComponent }
+        }
+        guard !newest.isEmpty else {
+            fileLabel.text = "no logs yet"
+            return
+        }
+        let sheet = UIActivityViewController(activityItems: newest, applicationActivities: nil)
+        sheet.popoverPresentationController?.sourceView = shareButton
+        present(sheet, animated: true)
     }
 
     @objc private func toggleRecording() {

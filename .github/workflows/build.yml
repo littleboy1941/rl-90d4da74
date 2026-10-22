@@ -1,4 +1,5 @@
-# RoundLab: unsigned IPA (signed on the PC with zsign, installed over USB).
+# RoundLab: unsigned IPA (signed on the PC with zsign, installed over USB)
+# and, when the signing secrets are set, an App Store-signed build uploaded to TestFlight.
 name: build
 
 on:
@@ -12,7 +13,10 @@ permissions:
 jobs:
   build:
     runs-on: macos-26
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      HAS_SIGNING: ${{ secrets.DIST_P12_BASE64 != '' }}
+      TEAM_ID: V6U3L6CJLA
     defaults:
       run:
         shell: bash
@@ -23,6 +27,9 @@ jobs:
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Ensure iOS platform (actool for the app icon)
+        run: xcrun simctl list runtimes | grep -q 'iOS' || xcodebuild -downloadPlatform iOS
 
       - name: Compile
         run: |
@@ -46,6 +53,11 @@ jobs:
           APP="build/Payload/RoundLab.app"
           PLIST="$APP/Info.plist"
           cp RoundLab/Info.plist "$PLIST"
+          xcrun actool RoundLab/Assets.xcassets --compile "$APP" \
+            --platform iphoneos --minimum-deployment-target 17.0 --target-device iphone \
+            --app-icon AppIcon --output-partial-info-plist "$RUNNER_TEMP/assets.plist" \
+            --output-format human-readable-text --notices --warnings
+          /usr/libexec/PlistBuddy -c "Merge $RUNNER_TEMP/assets.plist" "$PLIST"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$PLIST"
           SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
           SDK_BUILD="$(xcrun --sdk iphoneos --show-sdk-build-version)"
@@ -73,3 +85,62 @@ jobs:
           name: RoundLab-ipa
           path: build/RoundLab.ipa
           retention-days: 14
+
+      - name: Sign for App Store
+        if: env.HAS_SIGNING == 'true'
+        env:
+          DIST_P12_BASE64: ${{ secrets.DIST_P12_BASE64 }}
+          DIST_P12_PASSWORD: ${{ secrets.DIST_P12_PASSWORD }}
+          PROFILE_APP_BASE64: ${{ secrets.PROFILE_APP_BASE64 }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(openssl rand -hex 16)
+          echo "$DIST_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/dist.p12" -P "$DIST_P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/dist.p12"
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk '/Apple Distribution/{print $2; exit}')
+          test -n "$identity"
+
+          mkdir -p build/store
+          cp -R build/Payload build/store/Payload
+          APP="build/store/Payload/RoundLab.app"
+          echo "$PROFILE_APP_BASE64" | base64 --decode > "$APP/embedded.mobileprovision"
+          cat > "$RUNNER_TEMP/app.entitlements" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>application-identifier</key><string>$TEAM_ID.com.roundlab.stand</string>
+            <key>com.apple.developer.team-identifier</key><string>$TEAM_ID</string>
+            <key>get-task-allow</key><false/>
+            <key>beta-reports-active</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          codesign --force --sign "$identity" --keychain "$keychain" \
+            --entitlements "$RUNNER_TEMP/app.entitlements" --generate-entitlement-der "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+          codesign -dvv "$APP" 2>&1 | grep -E 'Authority=Apple Distribution|TeamIdentifier'
+          cd build/store
+          zip -qry RoundLab-store.ipa Payload
+          ls -l RoundLab-store.ipa
+
+      - name: Upload to TestFlight
+        if: env.HAS_SIGNING == 'true'
+        env:
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          echo "$ASC_KEY_P8_BASE64" | base64 --decode > "$HOME/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8"
+          echo "Build number: $GITHUB_RUN_NUMBER"
+          xcrun altool --upload-app -f build/store/RoundLab-store.ipa -t ios \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID"
