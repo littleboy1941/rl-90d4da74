@@ -103,6 +103,9 @@ final class StandViewController: UIViewController {
         fileLabel.textAlignment = .center
         fileLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(fileLabel)
+        // Which TestFlight build is on the phone (CFBundleVersion = CI run number).
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        fileLabel.text = "build \(build)"
 
         recordButton.setTitle("REC", for: .normal)
         recordButton.setTitleColor(.white, for: .normal)
