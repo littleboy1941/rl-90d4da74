@@ -5,8 +5,9 @@ import SceneKit
 import UIKit
 
 // "ASCII face" (author 2026-10-22): only the face - the ARKit mesh, forehead
-// to chin - is drawn with real everyday Linux command lines on black; the
-// rest of the frame stays the live camera. Light cells show whole readable commands,
+// to chin, plus the skin found around it in the same frame (the mesh lags
+// fast head turns) - is drawn with real everyday Linux command lines on
+// black; the rest of the frame stays the live camera. Light cells show whole readable commands,
 // darker cells drop letters, and on the face contours only the command
 // syntax that matches the edge direction stays (`/` from paths, `|` from
 // pipes, `-` from flags, `\`). Commands that change or delete things
@@ -48,16 +49,27 @@ struct AsciiStyle: FaceStyle {
 
     func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage {
         let extent = camera.extent
-        // Shader missing (compile error on the device): never show the bare face.
-        let text = AsciiGPU.shared.run(camera, face: face.bounds, palette: palette,
-                                       scroll: Float(time) * scrollPerSecond)
-            ?? camera.applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: 24]).cropped(to: extent)
-        // Mesh alpha, grown outward (gaps at the edges while turning), edge
-        // softened by ~1.5 px, picks text over the live frame.
+        guard let result = AsciiGPU.shared.run(camera, face: face.bounds, palette: palette,
+                                               scroll: Float(time) * scrollPerSecond) else {
+            // Shader missing (compile error on the device): never show the bare face.
+            return camera.applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: 24]).cropped(to: extent)
+        }
+        let text = result.text
+        // Two masks, whichever covers more: the ARKit mesh (grown outward;
+        // it lags behind fast head turns and stops short of the cheek sides)
+        // and the skin found in this very frame around the face, so the text
+        // stays on the face while it moves. Edge softened by ~1.5 px.
         let bounds = face.bounds
         let grow = bounds.isNull ? 0 : bounds.width * maskGrow
-        let mask = overlay.clampedToExtent()
+        let mesh = overlay.clampedToExtent()
             .applyingFilter("CIMorphologyMaximum", parameters: [kCIInputRadiusKey: grow])
+        let skin = result.skin.applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputAVector": CIVector(x: 1, y: 0, z: 0, w: 0),
+        ]).clampedToExtent()
+        let mask = mesh.applyingFilter("CIMaximumCompositing", parameters: [kCIInputBackgroundImageKey: skin])
             .applyingGaussianBlur(sigma: 1.5)
             .cropped(to: extent)
         return text.applyingFilter("CIBlendWithAlphaMask", parameters: [
@@ -146,6 +158,7 @@ final class AsciiGPU {
     private let stream: MTLBuffer?
     private var source: MTLTexture?
     private var target: MTLTexture?
+    private var skin: MTLTexture?
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
 
     private init() {
@@ -205,7 +218,9 @@ final class AsciiGPU {
         return texture
     }
 
-    func run(_ image: CIImage, face: CGRect, palette: AsciiStyle.Palette, scroll: Float) -> CIImage? {
+    // Text over black, plus the per-cell skin mask (red channel, 0 or 1).
+    func run(_ image: CIImage, face: CGRect, palette: AsciiStyle.Palette, scroll: Float)
+        -> (text: CIImage, skin: CIImage)? {
         let width = Int(image.extent.width)
         let height = Int(image.extent.height)
         guard let device, let queue, let pipeline, let context, let atlas, let stream,
@@ -219,8 +234,13 @@ final class AsciiGPU {
             descriptor.usage = [.shaderRead, .shaderWrite, .renderTarget]
             source = device.makeTexture(descriptor: descriptor)
             target = device.makeTexture(descriptor: descriptor)
+            let mask = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .r8Unorm, width: width, height: height, mipmapped: false)
+            mask.storageMode = .private
+            mask.usage = [.shaderRead, .shaderWrite]
+            skin = device.makeTexture(descriptor: mask)
         }
-        guard let source, let target,
+        guard let source, let target, let skin,
               let commandBuffer = queue.makeCommandBuffer() else {
             return nil
         }
@@ -242,6 +262,7 @@ final class AsciiGPU {
         encoder.setTexture(source, index: 0)
         encoder.setTexture(atlas, index: 1)
         encoder.setTexture(target, index: 2)
+        encoder.setTexture(skin, index: 3)
         encoder.setBuffer(stream, offset: 0, index: 0)
         encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 1)
         let group = MTLSize(width: 16, height: 16, depth: 1)
@@ -253,7 +274,11 @@ final class AsciiGPU {
         guard commandBuffer.status == .completed else {
             return nil
         }
-        return CIImage(mtlTexture: target, options: [.colorSpace: colorSpace])
+        guard let text = CIImage(mtlTexture: target, options: [.colorSpace: colorSpace]),
+              let mask = CIImage(mtlTexture: skin, options: [.colorSpace: NSNull()]) else {
+            return nil
+        }
+        return (text, mask)
     }
 
     // Texture rows follow Core Image rows (bottom up), as in LeakGPU; the
@@ -273,6 +298,20 @@ final class AsciiGPU {
         return dot(cam.read(uint2(x, y)).rgb, float3(0.299, 0.587, 0.114));
     }
 
+    static float3 rgbAt(texture2d<float, access::read> cam, float2 s, constant Params &prm) {
+        int x = clamp(int(s.x), 0, int(prm.width) - 1);
+        int y = clamp(int(prm.height - 1.0 - s.y), 0, int(prm.height) - 1);
+        return cam.read(uint2(x, y)).rgb;
+    }
+
+    // Classic YCbCr skin box (Cr 135-180, Cb 85-135 of 255), not too dark.
+    static bool isSkin(float3 c) {
+        float y = dot(c, float3(0.299, 0.587, 0.114));
+        float cb = 0.5 - 0.1687 * c.r - 0.3313 * c.g + 0.5 * c.b;
+        float cr = 0.5 + 0.5 * c.r - 0.4187 * c.g - 0.0813 * c.b;
+        return y > 0.15 && cr > 0.53 && cr < 0.71 && cb > 0.33 && cb < 0.53;
+    }
+
     static uint edgeGlyph(float2 g) {
         // g = brightness gradient (screen x right, y down); the edge runs across it.
         float a = fmod(atan2(g.y, g.x) * 57.29578 + 360.0, 180.0);
@@ -285,6 +324,7 @@ final class AsciiGPU {
     kernel void ascii(texture2d<float, access::read> cam [[texture(0)]],
                       texture2d<float, access::read> atlas [[texture(1)]],
                       texture2d<float, access::write> dst [[texture(2)]],
+                      texture2d<float, access::write> skinOut [[texture(3)]],
                       constant uchar *stream [[buffer(0)]],
                       constant Params &prm [[buffer(1)]],
                       uint2 gid [[thread_position_in_grid]]) {
@@ -296,14 +336,24 @@ final class AsciiGPU {
         uint row = uint(sy / prm.cellH);
         float2 center = float2((float(col) + 0.5) * prm.cellW, (float(row) + 0.5) * prm.cellH);
 
-        // Only cells near the face box are drawn; the exact face shape comes
-        // from the mesh mask applied after this pass.
+        // Cells around the face box are drawn (the box lags fast turns, so it
+        // is generous); the final shape is the mesh and skin masks.
         float fade = 0.0;
+        float skin = 0.0;
         if (prm.faceW > 4.0) {
-            float2 lo = float2(prm.faceX, prm.faceY) - float2(prm.faceW, prm.faceH) * 0.1;
-            float2 hi = float2(prm.faceX + prm.faceW, prm.faceY + prm.faceH) + float2(prm.faceW, prm.faceH) * 0.1;
+            float2 lo = float2(prm.faceX - prm.faceW * 0.25, prm.faceY - prm.faceH * 0.15);
+            float2 hi = float2(prm.faceX + prm.faceW * 1.25, prm.faceY + prm.faceH * 1.08);
             fade = all(center >= lo) && all(center <= hi) ? 1.0 : 0.0;
+            if (fade > 0.0) {
+                // Skin cell: at least 3 of 4 taps look like skin in this frame.
+                int hits = int(isSkin(rgbAt(cam, center + float2(-1, -2), prm)))
+                         + int(isSkin(rgbAt(cam, center + float2(1, -2), prm)))
+                         + int(isSkin(rgbAt(cam, center + float2(-1, 2), prm)))
+                         + int(isSkin(rgbAt(cam, center + float2(1, 2), prm)));
+                skin = hits >= 3 ? 1.0 : 0.0;
+            }
         }
+        skinOut.write(float4(skin, 0.0, 0.0, 1.0), gid);
         float3 color = float3(0.0);
         if (fade > 0.0) {
             // Cell brightness (4 taps) against its surroundings (8 taps, 12 px):
