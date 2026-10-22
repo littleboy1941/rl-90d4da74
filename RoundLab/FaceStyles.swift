@@ -450,20 +450,27 @@ enum AcidShader {
         int2 q = int2(p.x + int(wave), p.y);
 
         float l = luma(cam, q, w, h);
-        float n4 = (luma(cam, q + int2(2, 0), w, h) + luma(cam, q - int2(2, 0), w, h)
-                  + luma(cam, q + int2(0, 2), w, h) + luma(cam, q - int2(0, 2), w, h)) * 0.25;
-        float detail = l + (l - n4) * (2.5 + 2.0 * outside);       // grain from noise
+        // 3x3 taps 4 px apart: smooth brightness, so the colors form broad
+        // zones instead of following the sensor noise.
+        float smooth = 0.0;
+        for (int dy = -4; dy <= 4; dy += 4) {
+            for (int dx = -4; dx <= 4; dx += 4) {
+                smooth += luma(cam, q + int2(dx, dy), w, h);
+            }
+        }
+        smooth /= 9.0;
+        float detail = smooth + (l - smooth) * (0.8 + 1.5 * outside);   // grain, stronger outside
         float3 rgb = cam.read(uint2(clamp(q, int2(0), int2(w - 1, h - 1)))).rgb;
         float origHue = atan2(1.732 * (rgb.g - rgb.b), 2.0 * rgb.r - rgb.g - rgb.b) / 6.2832 + 0.5;
 
-        float hue = fract(detail * 2.3 + origHue * 0.35 + t * 0.07);
-        float value = smoothstep(0.06, 0.45, detail);
+        float hue = fract(smooth * 2.0 + origHue * 0.3 + t * 0.07);
+        float value = smoothstep(0.03, 0.3, detail);
         float3 c = hsv2rgb(float3(hue, 1.0, value));
 
         // Dark contours where the brightness changes fast.
-        float gx = luma(cam, q + int2(1, 0), w, h) - luma(cam, q - int2(1, 0), w, h);
-        float gy = luma(cam, q + int2(0, 1), w, h) - luma(cam, q - int2(0, 1), w, h);
-        float edge = smoothstep(0.08, 0.2, abs(gx) + abs(gy));
+        float gx = luma(cam, q + int2(4, 0), w, h) - luma(cam, q - int2(4, 0), w, h);
+        float gy = luma(cam, q + int2(0, 4), w, h) - luma(cam, q - int2(0, 4), w, h);
+        float edge = smoothstep(0.14, 0.3, abs(gx) + abs(gy));
         c *= 1.0 - 0.8 * edge;
 
         // Red veins from the right eye (on screen) down the cheek.
@@ -478,8 +485,8 @@ enum AcidShader {
             if (mask > 0.0) {
                 float2 v = float2(float(p.x) * 0.09, (sy - t * 6.0) * 0.035);
                 float r = vnoise(v) * 0.65 + vnoise(v * 2.3) * 0.35;
-                float line = 1.0 - smoothstep(0.0, 0.05, abs(r - 0.5));
-                c = mix(c, float3(0.6, 0.02, 0.06), line * mask);
+                float line = 1.0 - smoothstep(0.02, 0.07, abs(r - 0.5));
+                c = mix(c, float3(0.5, 0.0, 0.04), line * mask);
             }
         }
         return c;
