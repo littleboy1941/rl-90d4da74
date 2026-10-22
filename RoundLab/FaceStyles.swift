@@ -250,6 +250,264 @@ struct SwirlStyle: FaceStyle {
     }
 }
 
+// "Melt" (author's reference 4, datamoshed anime still): the picture runs
+// down in vertical bands of block width, like repeated P-frames with a
+// downward motion vector. Under each band's start line every pixel copies
+// the previous output from a few pixels above, so the line above keeps
+// streaming down; a few blocks per frame refresh from the camera and then
+// fall too (block steps inside the drips). Fresh pixels get block chroma
+// (8 px), a mauve grade and rare pink / acid-green chroma errors; dragged
+// pixels pick up speckle that streaks into fine vertical lines. Bands over
+// the face and hair melt from the forehead / eyes down; the background
+// melts less. Every few seconds a keyframe resets all drips.
+struct MeltStyle: FaceStyle {
+    let name = "melt"
+    var block: Float = 4                // block size in output pixels
+    var epochSeconds = 3.5              // keyframe + new bands
+    var faceMeltShare = 0.85            // bands over the face that melt
+    var backgroundMeltShare = 0.4
+
+    func makeNodes(device: MTLDevice) -> [StyledNode] {
+        []
+    }
+
+    func backdrop(_ camera: CIImage) -> CIImage {
+        camera
+    }
+
+    func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage {
+        let extent = camera.extent
+        let epoch = Int(time / epochSeconds)
+        let columns = meltColumns(face: face.bounds, extent: extent, epoch: epoch)
+        return MeltGPU.shared.run(camera, columns: columns, block: block, epoch: epoch, time: time) ?? camera
+    }
+
+    func finish(_ image: CIImage, time: Double) -> CIImage {
+        image
+    }
+
+    // Bands of 1-6 blocks; each band's start line (screen y, top down) and
+    // speed in pixels per frame. Same bands for the whole epoch.
+    func meltColumns(face: CGRect, extent: CGRect, epoch: Int) -> [MeltColumn] {
+        let count = Int(ceil(Float(extent.width) / block))
+        var columns = [MeltColumn](repeating: MeltColumn(), count: count)
+        var generator = SplitMix(seed: UInt64(max(epoch, 0)) &* 7919 &+ 17)
+        let height = Float(extent.height)
+        let hasFace = !face.isNull && face.width > 4
+        // Face box widened for the hair; screen y grows downward.
+        let hairLeft = Float(face.minX - face.width * 0.3)
+        let hairRight = Float(face.maxX + face.width * 0.3)
+        let faceTop = height - Float(face.maxY)
+        let faceHeight = Float(face.height)
+        func unit() -> Float {
+            Float(generator.next() % 10_000) / 10_000
+        }
+        var index = 0
+        while index < count {
+            let width = 1 + Int(generator.next() % 6)
+            let center = (Float(index) + Float(width) / 2) * block
+            let overFace = hasFace && center > hairLeft && center < hairRight
+            var column = MeltColumn()
+            if overFace {
+                if Double(unit()) < faceMeltShare {
+                    column.top = faceTop - 0.15 * faceHeight + unit() * 0.6 * faceHeight
+                    column.speed = Float(1 + generator.next() % 4)
+                    column.refresh = 0.012
+                }
+            } else if Double(unit()) < backgroundMeltShare {
+                column.top = height * (0.15 + 0.75 * unit())
+                column.speed = Float(1 + generator.next() % 3)
+                column.refresh = 0.04
+            }
+            for i in index..<min(index + width, count) {
+                columns[i] = column
+            }
+            index += width
+        }
+        return columns
+    }
+}
+
+// Same memory layout as `Column` in MeltGPU's Metal source (4 floats).
+struct MeltColumn {
+    var top: Float = 0
+    var speed: Float = 0
+    var refresh: Float = 1
+    var pad: Float = 0
+}
+
+// One compute pass with feedback: reads the camera and the previous output,
+// writes the next output. Three output textures in a ring, so the one Core
+// Image is still showing is never the one being written. Texture rows
+// follow Core Image rows (bottom up), as in LeakGPU.
+final class MeltGPU {
+    static let shared = MeltGPU()
+
+    private struct Params {
+        var width: Float
+        var height: Float
+        var block: Float
+        var columns: UInt32
+        var frame: UInt32
+        var keyframe: UInt32
+    }
+
+    private let device: MTLDevice?
+    private let queue: MTLCommandQueue?
+    private let pipeline: MTLComputePipelineState?
+    private let context: CIContext?
+    private var source: MTLTexture?
+    private var ring: [MTLTexture] = []
+    private var current = 0
+    private var frame: UInt32 = 0
+    private var lastEpoch = -1
+    private var lastTime = 0.0
+    private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+
+    private init() {
+        device = MTLCreateSystemDefaultDevice()
+        queue = device?.makeCommandQueue()
+        context = device.map { CIContext(mtlDevice: $0, options: [.cacheIntermediates: false]) }
+        if let device,
+           let library = try? device.makeLibrary(source: Self.shader, options: nil),
+           let function = library.makeFunction(name: "melt") {
+            pipeline = try? device.makeComputePipelineState(function: function)
+        } else {
+            pipeline = nil
+        }
+    }
+
+    func run(_ image: CIImage, columns: [MeltColumn], block: Float, epoch: Int, time: Double) -> CIImage? {
+        let width = Int(image.extent.width)
+        let height = Int(image.extent.height)
+        guard let device, let queue, let pipeline, let context, !columns.isEmpty, width > 0, height > 0 else {
+            return nil
+        }
+        var keyframe = epoch != lastEpoch || time - lastTime > 0.25
+        if source?.width != width || source?.height != height {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false)
+            descriptor.storageMode = .private
+            descriptor.usage = [.shaderRead, .shaderWrite, .renderTarget]
+            source = device.makeTexture(descriptor: descriptor)
+            ring = (0..<3).compactMap { _ in device.makeTexture(descriptor: descriptor) }
+            keyframe = true
+        }
+        lastEpoch = epoch
+        lastTime = time
+        guard let source, ring.count == 3,
+              let commandBuffer = queue.makeCommandBuffer() else {
+            return nil
+        }
+        let previous = ring[current]
+        current = (current + 1) % 3
+        let target = ring[current]
+        frame &+= 1
+        let graded = image.applyingFilter("CIColorControls", parameters: [
+            kCIInputSaturationKey: 0.75,
+            kCIInputContrastKey: 1.12,
+        ])
+        context.render(
+            graded,
+            to: source,
+            commandBuffer: commandBuffer,
+            bounds: image.extent,
+            colorSpace: colorSpace)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            return nil
+        }
+        var params = Params(
+            width: Float(width), height: Float(height), block: block,
+            columns: UInt32(columns.count), frame: frame, keyframe: keyframe ? 1 : 0)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setTexture(source, index: 0)
+        encoder.setTexture(previous, index: 1)
+        encoder.setTexture(target, index: 2)
+        columns.withUnsafeBytes { bytes in
+            encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 0)
+        }
+        encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 1)
+        let group = MTLSize(width: 16, height: 16, depth: 1)
+        let grid = MTLSize(width: (width + 15) / 16, height: (height + 15) / 16, depth: 1)
+        encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: group)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else {
+            return nil
+        }
+        return CIImage(mtlTexture: target, options: [.colorSpace: colorSpace])
+    }
+
+    private static let shader = """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    struct Column { float top; float speed; float refresh; float pad; };
+    struct Params { float width; float height; float block; uint columns; uint frame; uint keyframe; };
+
+    static float hash3(uint a, uint b, uint c) {
+        uint h = a * 73856093u ^ b * 19349663u ^ c * 83492791u;
+        h ^= h >> 13; h *= 0x5bd1e995u; h ^= h >> 15;
+        return float(h & 0xffffffu) / 16777216.0;
+    }
+
+    // Fresh pixel: luma from the pixel, chroma from its 2x2-block cell,
+    // mauve grade, rare chroma errors that stick to the cell for a while.
+    static float3 fresh(texture2d<float, access::read> cam, uint2 p, uint bx, uint by,
+                        constant Params &prm) {
+        int w = int(prm.width);
+        int h = int(prm.height);
+        float cell = prm.block * 2.0;
+        int2 q = int2(floor(float2(p) / cell) * cell + cell * 0.5);
+        q = clamp(q, int2(0), int2(w - 1, h - 1));
+        float3 rgb = cam.read(p).rgb;
+        float3 chroma = cam.read(uint2(q)).rgb;
+        float y = dot(rgb, float3(0.299, 0.587, 0.114));
+        float cy = dot(chroma, float3(0.299, 0.587, 0.114));
+        float cb = (chroma.b - cy) * 0.564 * 0.8 + 0.012;
+        float cr = (chroma.r - cy) * 0.713 * 0.8 + 0.03;
+        float e = hash3(bx / 2u, by / 2u, prm.frame / 20u);
+        if (e > 0.9975) { cb = 0.06; cr = 0.2; }            // pink
+        else if (e > 0.995) { cb = -0.22; cr = -0.08; }     // acid green
+        y = y * 0.92 + 0.05;
+        return saturate(float3(y + 1.403 * cr, y - 0.344 * cb - 0.714 * cr, y + 1.773 * cb));
+    }
+
+    kernel void melt(texture2d<float, access::read> cam [[texture(0)]],
+                     texture2d<float, access::read> prev [[texture(1)]],
+                     texture2d<float, access::write> dst [[texture(2)]],
+                     constant Column *cols [[buffer(0)]],
+                     constant Params &prm [[buffer(1)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) {
+            return;
+        }
+        int h = int(prm.height);
+        float sy = prm.height - 1.0 - float(gid.y);           // screen y, top down
+        uint bx = uint(float(gid.x) / prm.block);
+        uint by = uint(sy / prm.block);
+        Column col = cols[min(bx, prm.columns - 1u)];
+        bool zone = col.speed > 0.0 && sy > col.top;
+        bool refresh = prm.keyframe != 0u || !zone || hash3(bx, by, prm.frame) < col.refresh;
+        float3 c;
+        if (refresh) {
+            c = fresh(cam, gid, bx, by, prm);
+        } else {
+            int py = min(int(gid.y) + int(col.speed), h - 1);  // from above on screen
+            c = prev.read(uint2(gid.x, uint(py))).rgb;
+            float n = hash3(gid.x, gid.y, prm.frame);
+            if (n > 0.997) {
+                c = mix(c, float3(0.95, 0.78, 0.88), 0.5);
+            } else if (n < 0.002) {
+                c *= 0.8;
+            }
+        }
+        dst.write(float4(c, 1.0), gid);
+    }
+    """
+}
+
 // Same memory layout as `Row` in LeakGPU's Metal source (6 floats).
 struct LeakRow {
     var edge: Float = 0
