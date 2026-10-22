@@ -13,6 +13,7 @@ final class FaceParser {
     static let shared = FaceParser()
     static let side = 512                       // model input
     static let grid = 64                        // logits grid
+    static let cropScale: CGFloat = 1.7         // crop side, of the face box
     static let faceClasses: Set<Int> = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12]
 
     static var lastMs = 0.0                    // this frame's prediction, for the frame log
@@ -35,17 +36,28 @@ final class FaceParser {
     }
 
     // Mask over `image` (white with alpha = face probability), or nil.
-    func faceMask(_ image: CIImage) -> CIImage? {
+    // With a face box the network sees a square crop around the face
+    // (as in its training set, CelebAMask-HQ): ~2x more grid cells on the
+    // face than the whole frame, so a finer, steadier contour.
+    func faceMask(_ image: CIImage, around face: CGRect = .null) -> CIImage? {
         guard let model, let input else {
             return nil
         }
         let start = CACurrentMediaTime()
         defer { Self.lastMs = (CACurrentMediaTime() - start) * 1000 }
         let extent = image.extent
-        // The whole square frame scaled to 512 (no crop: faces near the edge keep logits).
-        let scale = CGFloat(Self.side) / max(extent.width, extent.height)
-        let fitted = image
-            .transformed(by: CGAffineTransform(translationX: -extent.minX, y: -extent.minY))
+        let crop: CGRect
+        if face.isNull || face.width < 8 {
+            let side = max(extent.width, extent.height)
+            crop = CGRect(x: extent.minX, y: extent.minY, width: side, height: side)
+        } else {
+            let side = max(face.width, face.height) * Self.cropScale
+            crop = CGRect(x: face.midX - side / 2, y: face.midY - side / 2, width: side, height: side)
+        }
+        let scale = CGFloat(Self.side) / crop.width
+        // Edge pixels repeated past the frame border, so the crop never sees black.
+        let fitted = image.clampedToExtent()
+            .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
             .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
         context.render(fitted, to: input, bounds: CGRect(x: 0, y: 0, width: Self.side, height: Self.side),
                        colorSpace: CGColorSpaceCreateDeviceRGB())
@@ -58,9 +70,12 @@ final class FaceParser {
         guard let small = Self.grayImage(probability, side: Self.grid) else {
             return nil
         }
-        // 64 -> frame size with smooth sampling, then a steeper edge around p = 0.5.
-        let up = CGFloat(Self.side) / CGFloat(Self.grid) / scale
-        return small
+        // 64 -> crop size: smoothed over ~half a cell first (no grid steps),
+        // then a steeper edge around p = 0.5.
+        let up = crop.width / CGFloat(Self.grid)
+        return small.clampedToExtent()
+            .applyingGaussianBlur(sigma: 0.6)
+            .cropped(to: CGRect(x: 0, y: 0, width: Self.grid, height: Self.grid))
             .transformed(by: CGAffineTransform(scaleX: up, y: up))
             .applyingFilter("CIColorMatrix", parameters: [
                 "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
@@ -70,7 +85,7 @@ final class FaceParser {
                 "inputBiasVector": CIVector(x: 1, y: 1, z: 1, w: -1),
             ])
             .applyingFilter("CIColorClamp")
-            .transformed(by: CGAffineTransform(translationX: extent.minX, y: extent.minY))
+            .transformed(by: CGAffineTransform(translationX: crop.minX, y: crop.minY))
             .cropped(to: extent)
     }
 

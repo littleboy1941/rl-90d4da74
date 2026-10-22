@@ -49,16 +49,21 @@ struct AsciiStyle: FaceStyle {
 
     func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage {
         let extent = camera.extent
-        guard let result = AsciiGPU.shared.run(camera, face: face.bounds, palette: palette,
+        let bounds = face.bounds
+        // Main mask: the face-parsing network on this very frame (no lag).
+        let parsed = FaceParser.shared.faceMask(camera, around: bounds)
+        // With the network mask the text box is widened, so every masked
+        // pixel gets characters (the mask may reach past the ARKit box).
+        let textBox = parsed == nil || bounds.isNull
+            ? bounds : bounds.insetBy(dx: -bounds.width * 0.15, dy: -bounds.height * 0.2)
+        guard let result = AsciiGPU.shared.run(camera, face: textBox, palette: palette,
                                                scroll: Float(time) * scrollPerSecond) else {
             // Shader missing (compile error on the device): never show the bare face.
             return camera.applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: 24]).cropped(to: extent)
         }
         let text = result.text
-        let bounds = face.bounds
-        // Main mask: the face-parsing network on this very frame (no lag),
-        // grown by ~2% of the face width so the border pixels are covered.
-        if let parsed = FaceParser.shared.faceMask(camera) {
+        // Network mask grown by ~2% of the face width so the border pixels are covered.
+        if let parsed {
             let mask = parsed.clampedToExtent()
                 .applyingFilter("CIMorphologyMaximum", parameters: [
                     kCIInputRadiusKey: bounds.isNull ? 2 : max(2, bounds.width * 0.02),
