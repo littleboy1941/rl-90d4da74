@@ -9,8 +9,8 @@ protocol FrameSource: AnyObject {
     func stop()
 }
 
-// Mirrors the Telegram round video path: front camera (32BGRA, up to
-// 640x480) -> Vision face landmarks -> 2D effect -> 400x400 square.
+// Mirrors the Telegram round video path: front or back camera (32BGRA,
+// up to 640x480) -> Vision face landmarks -> 2D effect -> 400x400 square.
 // Preview and recording get the same processed frame, so nothing raw
 // can reach the file.
 final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleBufferDelegate {
@@ -28,6 +28,8 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     private var lastPresentation: CMTime?
     private var lastFaces: [Face] = []
     private var lastFaceTime: CFTimeInterval = -1
+    private var position: AVCaptureDevice.Position = .front
+    private var input: AVCaptureDeviceInput?
 
     init(output: RoundOutput, effect: RoundEffect) {
         self.output = output
@@ -59,23 +61,30 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
         }
     }
 
+    // Front <-> back. Held faces belong to the old camera, so drop them;
+    // until the new camera finds a face the frame is fully covered.
+    func setPosition(_ next: AVCaptureDevice.Position) {
+        queue.async { [self] in
+            guard next != position else {
+                return
+            }
+            position = next
+            lastFaces = []
+            lastFaceTime = -1
+            guard configured else {
+                return
+            }
+            session.beginConfiguration()
+            defer { session.commitConfiguration() }
+            try? attachCamera()
+        }
+    }
+
     private func configure() throws {
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         session.sessionPreset = .vga640x480
-        guard let device = AVCaptureDevice.default(
-            .builtInWideAngleCamera,
-            for: .video,
-            position: .front
-        ) else {
-            throw NSError(domain: "RoundLab", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "Front camera not found",
-            ])
-        }
-        let input = try AVCaptureDeviceInput(device: device)
-        if session.canAddInput(input) {
-            session.addInput(input)
-        }
+        try attachCamera()
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
         ]
@@ -83,6 +92,27 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
         videoOutput.setSampleBufferDelegate(self, queue: queue)
         if session.canAddOutput(videoOutput) {
             session.addOutput(videoOutput)
+        }
+    }
+
+    // Called inside a session configuration block.
+    private func attachCamera() throws {
+        guard let device = AVCaptureDevice.default(
+            .builtInWideAngleCamera,
+            for: .video,
+            position: position
+        ) else {
+            throw NSError(domain: "RoundLab", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Camera not found",
+            ])
+        }
+        if let input {
+            session.removeInput(input)
+        }
+        let next = try AVCaptureDeviceInput(device: device)
+        if session.canAddInput(next) {
+            session.addInput(next)
+            input = next
         }
         // Buffers stay in the sensor orientation (landscape); the pipeline
         // rotates and mirrors them itself, like Telegram's round video filter.
@@ -109,11 +139,11 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
         let intervalMs = lastPresentation.map { (presentation - $0).seconds * 1000 } ?? 0
         lastPresentation = presentation
 
-        // Front camera, portrait: the sensor buffer is landscape; rotate it
-        // upright and mirror it like a selfie preview.
+        // Portrait: the sensor buffer is landscape; rotate it upright, and
+        // mirror the front camera like a selfie preview.
         var source = CIImage(cvPixelBuffer: pixels)
         if source.extent.width > source.extent.height {
-            source = source.oriented(.leftMirrored)
+            source = source.oriented(position == .back ? .right : .leftMirrored)
         }
         source = source.transformed(by: CGAffineTransform(
             translationX: -source.extent.minX,
@@ -145,7 +175,10 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
         let held = faces.isEmpty
             && lastFaceTime >= 0
             && visionEnd - lastFaceTime <= holdSeconds
-        let used = faces.isEmpty ? (held ? lastFaces : []) : faces
+        let holdShare = CGFloat((visionEnd - lastFaceTime) / holdSeconds)
+        let used = faces.isEmpty
+            ? (held ? lastFaces.map { var face = $0; face.hold = holdShare; return face } : [])
+            : faces
         let lost = visionFailed || used.isEmpty
 
         let processed = effect.apply(to: source, faces: used, trackingLost: lost, time: presentation.seconds)

@@ -3,10 +3,12 @@ import CoreImage
 
 // One tracked face in source pixel coordinates (Core Image coordinates,
 // origin at the bottom left). Contour runs along the jaw from ear to ear;
-// empty when Vision returned no landmarks.
+// empty when Vision returned no landmarks. `hold` is 0 for a face seen in
+// this frame and grows to 1 while the last seen face is held after a miss.
 struct Face {
     var rect: CGRect
     var contour: [CGPoint]
+    var hold: CGFloat = 0
 }
 
 // Effect contract shared with the future Telegram port: Telegram's round
@@ -266,4 +268,71 @@ final class Mask {
     }
 }
 
-let allEffects: [RoundEffect] = [SignalEffect(), BlackSilhouetteEffect(), BlackOvalEffect()]
+// Real censoring blur (author's choice 2026-10-22): every head in the frame
+// (face box widened to hair and ears) under a strong soft blur with a
+// feathered edge. Irreversible: the frame is shrunk 20x before blurring,
+// so a 200 px face keeps ~10 px of color and nothing can be unblurred.
+// A held face (missed for < 0.5 s) keeps its place and grows; after that
+// the whole frame is blurred until a face is found again (fail closed).
+struct BlurEffect: RoundEffect {
+    let name = "blur"
+    var shrink: CGFloat = 20          // frame downscale before blurring
+    var headWidth: CGFloat = 1.6      // of the face box width
+    var headHeight: CGFloat = 1.9     // of the face box height
+    var headLift: CGFloat = 0.12      // oval center above the box center, of its height
+    var holdGrowth: CGFloat = 0.5     // extra size at the end of a hold
+    var feather: CGFloat = 0.08       // edge softness, of the head width
+
+    func apply(to image: CIImage, faces: [Face], trackingLost: Bool, time: Double) -> CIImage {
+        let extent = image.extent
+        let blurred = Self.heavyBlur(image, shrink: shrink)
+        if trackingLost {
+            return blurred
+        }
+        // Feather outward only: each oval is drawn larger by 2 sigma, so after
+        // blurring the mask the oval itself is still fully covered.
+        let mask = Mask(extent: extent)
+        var widest: CGFloat = 0
+        for face in faces {
+            let grow = 1 + holdGrowth * min(max(face.hold, 0), 1)
+            let width = face.rect.width * headWidth * grow
+            let height = face.rect.height * headHeight * grow
+            let pad = width * feather * 2
+            let center = CGPoint(x: face.rect.midX, y: face.rect.midY + face.rect.height * headLift)
+            mask.context?.fillEllipse(in: CGRect(
+                x: center.x - width / 2 - pad, y: center.y - height / 2 - pad,
+                width: width + pad * 2, height: height + pad * 2))
+            widest = max(widest, width)
+        }
+        guard let alpha = mask.ciImage() else {
+            return blurred
+        }
+        let soft = alpha.clampedToExtent()
+            .applyingGaussianBlur(sigma: Double(max(widest * feather, 1)))
+            .cropped(to: extent)
+        return blurred.applyingFilter("CIBlendWithAlphaMask", parameters: [
+            kCIInputBackgroundImageKey: image,
+            kCIInputMaskImageKey: soft,
+        ]).cropped(to: extent)
+    }
+
+    // Shrink (area average), blur a little at the small size, scale back up
+    // smoothly, then soften the upscale steps.
+    static func heavyBlur(_ image: CIImage, shrink: CGFloat) -> CIImage {
+        let extent = image.extent
+        let small = image.clampedToExtent()
+            .cropped(to: extent)
+            .applyingFilter("CILanczosScaleTransform", parameters: [
+                kCIInputScaleKey: 1 / shrink,
+                kCIInputAspectRatioKey: 1,
+            ])
+            .clampedToExtent()
+            .applyingGaussianBlur(sigma: 1.2)
+        return small
+            .transformed(by: CGAffineTransform(scaleX: shrink, y: shrink))
+            .applyingGaussianBlur(sigma: Double(shrink) * 0.6)
+            .cropped(to: extent)
+    }
+}
+
+let allEffects: [RoundEffect] = [BlurEffect(), SignalEffect(), BlackSilhouetteEffect(), BlackOvalEffect()]

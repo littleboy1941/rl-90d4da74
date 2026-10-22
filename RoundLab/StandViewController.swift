@@ -23,6 +23,31 @@ enum Mode {
         case .flat(let effect): return effect.name
         }
     }
+
+    // ARKit face styles need the front TrueDepth camera.
+    var needsFront: Bool {
+        if case .face = self {
+            return true
+        }
+        return false
+    }
+
+    var title: String {
+        Self.titles[name] ?? name
+    }
+
+    static let titles = [
+        "blur": "Размытие лиц",
+        "acid": "Acid",
+        "melt": "Melt (датамош)",
+        "mr_swirl": "Mr. Swirl",
+        "leak": "Вытекание",
+        "text_face": "Лицо из текста",
+        "ghost_mesh": "Призрак в сетке",
+        "signal": "Сигнал",
+        "black_silhouette": "Чёрный силуэт",
+        "black_oval": "Чёрный овал",
+    ]
 }
 
 final class StandViewController: UIViewController {
@@ -31,14 +56,18 @@ final class StandViewController: UIViewController {
     private lazy var faceSource: FaceSource? = FaceSource.isSupported
         ? FaceSource(output: output, style: allFaceStyles[0])
         : nil
-    private lazy var modes: [Mode] = (faceSource == nil ? [] : allFaceStyles.map { Mode.face($0) })
-        + allEffects.map { Mode.flat($0) }
+    // The real effect (blur) first, then the 3D styles, then the rest.
+    private lazy var modes: [Mode] = [Mode.flat(allEffects[0])]
+        + (faceSource == nil ? [] : allFaceStyles.map { Mode.face($0) })
+        + allEffects.dropFirst().map { Mode.flat($0) }
+    private var backCamera = false
     private var active: FrameSource?
 
     private let preview = PreviewView()
     private let recordButton = UIButton(type: .system)
     private let effectButton = UIButton(type: .system)
     private let shareButton = UIButton(type: .system)
+    private let cameraButton = UIButton(type: .system)
     private let statsLabel = UILabel()
     private let fileLabel = UILabel()
     private var modeIndex = 0
@@ -89,8 +118,16 @@ final class StandViewController: UIViewController {
         effectButton.backgroundColor = .darkGray
         effectButton.layer.cornerRadius = 28
         effectButton.translatesAutoresizingMaskIntoConstraints = false
-        effectButton.addTarget(self, action: #selector(nextMode), for: .touchUpInside)
+        effectButton.showsMenuAsPrimaryAction = true
         view.addSubview(effectButton)
+
+        cameraButton.setImage(UIImage(systemName: "arrow.triangle.2.circlepath.camera"), for: .normal)
+        cameraButton.tintColor = .white
+        cameraButton.backgroundColor = .darkGray
+        cameraButton.layer.cornerRadius = 28
+        cameraButton.translatesAutoresizingMaskIntoConstraints = false
+        cameraButton.addTarget(self, action: #selector(flipCamera), for: .touchUpInside)
+        view.addSubview(cameraButton)
 
         shareButton.setTitle("LOG", for: .normal)
         shareButton.setTitleColor(.white, for: .normal)
@@ -103,12 +140,17 @@ final class StandViewController: UIViewController {
 
         NSLayoutConstraint.activate([
             effectButton.centerYAnchor.constraint(equalTo: recordButton.centerYAnchor),
-            effectButton.trailingAnchor.constraint(equalTo: recordButton.leadingAnchor, constant: -32),
+            effectButton.trailingAnchor.constraint(equalTo: recordButton.leadingAnchor, constant: -24),
             effectButton.widthAnchor.constraint(equalToConstant: 56),
             effectButton.heightAnchor.constraint(equalToConstant: 56),
 
+            cameraButton.centerYAnchor.constraint(equalTo: recordButton.centerYAnchor),
+            cameraButton.trailingAnchor.constraint(equalTo: effectButton.leadingAnchor, constant: -16),
+            cameraButton.widthAnchor.constraint(equalToConstant: 56),
+            cameraButton.heightAnchor.constraint(equalToConstant: 56),
+
             shareButton.centerYAnchor.constraint(equalTo: recordButton.centerYAnchor),
-            shareButton.leadingAnchor.constraint(equalTo: recordButton.trailingAnchor, constant: 32),
+            shareButton.leadingAnchor.constraint(equalTo: recordButton.trailingAnchor, constant: 24),
             shareButton.widthAnchor.constraint(equalToConstant: 56),
             shareButton.heightAnchor.constraint(equalToConstant: 56),
 
@@ -159,6 +201,7 @@ final class StandViewController: UIViewController {
     }
 
     private func apply(_ mode: Mode) {
+        effectButton.menu = makeMenu()
         let next: FrameSource?
         switch mode {
         case .face(let style):
@@ -208,8 +251,31 @@ final class StandViewController: UIViewController {
         windowStart = now
     }
 
-    @objc private func nextMode() {
-        modeIndex = (modeIndex + 1) % modes.count
+    // Effect list; on the back camera only the Vision effects are offered.
+    private func makeMenu() -> UIMenu {
+        let actions = modes.indices
+            .filter { !backCamera || !modes[$0].needsFront }
+            .map { index in
+                UIAction(title: modes[index].title, state: index == modeIndex ? .on : .off) { [weak self] _ in
+                    self?.select(index)
+                }
+            }
+        return UIMenu(title: backCamera ? "Задняя камера" : "Фронтальная камера", children: actions)
+    }
+
+    private func select(_ index: Int) {
+        modeIndex = index
+        apply(modes[modeIndex])
+    }
+
+    // Back camera: Vision path only (ARKit face tracking is front-only);
+    // a 3D style falls back to the blur.
+    @objc private func flipCamera() {
+        backCamera.toggle()
+        visionSource.setPosition(backCamera ? .back : .front)
+        if backCamera, modes[modeIndex].needsFront {
+            modeIndex = 0
+        }
         apply(modes[modeIndex])
     }
 
