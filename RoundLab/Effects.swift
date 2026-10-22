@@ -11,6 +11,67 @@ struct Face {
     var contour: [CGPoint]
     var hold: CGFloat = 0
     var streak = 1
+    var info = ""                     // debug label from Vision
+}
+
+// Debug frame around one Vision detection: green = steady (used and held
+// after a miss), yellow = fresh (used, not held), blue = held after a miss,
+// grey = dropped as a false face (weak or too small).
+struct DebugBox {
+    enum Kind {
+        case steady, fresh, held, dropped
+    }
+
+    var rect: CGRect
+    var kind: Kind
+    var text: String
+
+    var color: CGColor {
+        switch kind {
+        case .steady: return CGColor(red: 0.2, green: 1, blue: 0.3, alpha: 1)
+        case .fresh: return CGColor(red: 1, green: 0.9, blue: 0.1, alpha: 1)
+        case .held: return CGColor(red: 0.3, green: 0.6, blue: 1, alpha: 1)
+        case .dropped: return CGColor(gray: 0.6, alpha: 1)
+        }
+    }
+
+    static func draw(_ boxes: [DebugBox], over image: CIImage) -> CIImage {
+        let extent = image.extent
+        let mask = Mask(extent: extent)
+        guard let context = mask.context else {
+            return image
+        }
+        context.setLineWidth(3)
+        for box in boxes {
+            context.setStrokeColor(box.color)
+            context.stroke(box.rect)
+        }
+        var result = mask.ciImage()?.composited(over: image) ?? image
+        for box in boxes {
+            guard let text = CIFilter(name: "CITextImageGenerator", parameters: [
+                "inputText": box.text,
+                "inputFontName": "Menlo-Bold",
+                "inputFontSize": 13,
+                "inputScaleFactor": 1,
+            ])?.outputImage else {
+                continue
+            }
+            let color = CIColor(cgColor: box.color)
+            let tinted = text.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+                "inputBiasVector": CIVector(x: color.red, y: color.green, z: color.blue, w: 0),
+            ])
+            let placed = tinted.transformed(by: CGAffineTransform(
+                translationX: box.rect.minX - tinted.extent.minX,
+                y: box.rect.maxY + 2 - tinted.extent.minY))
+            let plate = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0.6))
+                .cropped(to: placed.extent.insetBy(dx: -2, dy: -1))
+            result = placed.composited(over: plate.composited(over: result))
+        }
+        return result.cropped(to: extent)
+    }
 }
 
 // Effect contract shared with the future Telegram port: Telegram's round

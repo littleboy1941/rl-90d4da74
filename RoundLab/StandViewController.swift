@@ -61,6 +61,7 @@ final class StandViewController: UIViewController {
         + (faceSource == nil ? [] : allFaceStyles.map { Mode.face($0) })
         + allEffects.dropFirst().map { Mode.flat($0) }
     private var backCamera = false
+    private var debugBoxes = false
     private var active: FrameSource?
 
     private let preview = PreviewView()
@@ -260,7 +261,23 @@ final class StandViewController: UIViewController {
                     self?.select(index)
                 }
             }
-        return UIMenu(title: backCamera ? "Задняя камера" : "Фронтальная камера", children: actions)
+        let debug = UIAction(
+            title: "Отладка: рамки лиц (Vision)",
+            image: UIImage(systemName: "viewfinder"),
+            state: debugBoxes ? .on : .off
+        ) { [weak self] _ in
+            self?.toggleDebug()
+        }
+        return UIMenu(title: backCamera ? "Задняя камера" : "Фронтальная камера", children: [
+            UIMenu(options: .displayInline, children: actions),
+            UIMenu(options: .displayInline, children: [debug]),
+        ])
+    }
+
+    private func toggleDebug() {
+        debugBoxes.toggle()
+        visionSource.setDebug(debugBoxes)
+        effectButton.menu = makeMenu()
     }
 
     private func select(_ index: Int) {

@@ -22,6 +22,9 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     // Weaker or smaller detections are dropped as false faces.
     var minConfidence: Float = 0.5
     var minFaceShare: CGFloat = 0.04          // of the frame width
+    // Debug overlay: every Vision detection framed and labelled in the
+    // output (so it is also in recordings and screenshots).
+    var debug = false
 
     private let output: RoundOutput
     private let videoOutput = AVCaptureVideoDataOutput()
@@ -46,6 +49,12 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     func setEffect(_ next: RoundEffect) {
         queue.async { [self] in
             effect = next
+        }
+    }
+
+    func setDebug(_ on: Bool) {
+        queue.async { [self] in
+            debug = on
         }
     }
 
@@ -162,18 +171,25 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
 
         let visionStart = CACurrentMediaTime()
         var faces: [Face] = []
+        var dropped: [DebugBox] = []
         var visionFailed = false
         let request = VNDetectFaceLandmarksRequest()
         do {
             try sequenceHandler.perform([request], on: source, orientation: .up)
-            faces = (request.results ?? [])
-                .filter { $0.confidence >= minConfidence }
-                .map { observation in
-                    Face(
-                        rect: VNImageRectForNormalizedRect(observation.boundingBox, width, height),
-                        contour: observation.landmarks?.faceContour?.pointsInImage(imageSize: size) ?? [])
+            for observation in request.results ?? [] {
+                let rect = VNImageRectForNormalizedRect(observation.boundingBox, width, height)
+                let label = Self.label(observation)
+                guard observation.confidence >= minConfidence,
+                      rect.width >= CGFloat(width) * minFaceShare else {
+                    dropped.append(DebugBox(rect: rect, kind: .dropped, text: label))
+                    continue
                 }
-                .filter { $0.rect.width >= CGFloat(width) * minFaceShare }
+                var face = Face(
+                    rect: rect,
+                    contour: observation.landmarks?.faceContour?.pointsInImage(imageSize: size) ?? [])
+                face.info = label
+                faces.append(face)
+            }
             faces = faces.map { face in
                 var face = face
                 face.streak = 1 + (previousFaces
@@ -202,7 +218,19 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
             : faces
         let lost = visionFailed || used.isEmpty
 
-        let processed = effect.apply(to: source, faces: used, trackingLost: lost, time: presentation.seconds)
+        var processed = effect.apply(to: source, faces: used, trackingLost: lost, time: presentation.seconds)
+        if debug {
+            var boxes = dropped
+            if faces.isEmpty {
+                boxes += used.map { DebugBox(rect: $0.rect, kind: .held, text: "held " + $0.info) }
+            } else {
+                boxes += faces.map {
+                    DebugBox(rect: $0.rect, kind: $0.streak >= steadyFrames ? .steady : .fresh,
+                             text: "s\($0.streak) " + $0.info)
+                }
+            }
+            processed = DebugBox.draw(boxes, over: processed)
+        }
         let side = output.side
         let square = min(width, height)
         let crop = CGRect(
@@ -237,6 +265,19 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
                 faces: faces.count,
                 held: held,
                 lost: lost))
+    }
+
+    // c = face confidence, l = landmarks confidence, y/p = yaw/pitch degrees.
+    static func label(_ observation: VNFaceObservation) -> String {
+        func degrees(_ value: NSNumber?) -> String {
+            value.map { String(Int(($0.doubleValue * 180 / .pi).rounded())) } ?? "-"
+        }
+        return String(
+            format: "c%.2f l%.2f y%@ p%@",
+            observation.confidence,
+            observation.landmarks?.confidence ?? -1,
+            degrees(observation.yaw),
+            degrees(observation.pitch))
     }
 
     // Intersection over union of two face boxes.
