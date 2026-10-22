@@ -69,6 +69,11 @@ jobs:
             --app-icon AppIcon --output-partial-info-plist "$RUNNER_TEMP/assets.plist" \
             --output-format human-readable-text --notices --warnings
           /usr/libexec/PlistBuddy -c "Merge $RUNNER_TEMP/assets.plist" "$PLIST"
+          # Core ML models: compiled to .mlmodelc inside the app.
+          for model in Models/*.mlpackage; do
+            xcrun coremlcompiler compile "$model" "$APP"
+          done
+          ls "$APP"
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$PLIST"
           SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
           SDK_BUILD="$(xcrun --sdk iphoneos --show-sdk-build-version)"

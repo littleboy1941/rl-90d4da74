@@ -55,11 +55,25 @@ struct AsciiStyle: FaceStyle {
             return camera.applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: 24]).cropped(to: extent)
         }
         let text = result.text
-        // Two masks, whichever covers more: the ARKit mesh (grown outward;
-        // it lags behind fast head turns and stops short of the cheek sides)
-        // and the skin found in this very frame around the face, so the text
-        // stays on the face while it moves. Edge softened by ~1.5 px.
         let bounds = face.bounds
+        // Main mask: the face-parsing network on this very frame (no lag),
+        // grown by ~2% of the face width so the border pixels are covered.
+        if let parsed = FaceParser.shared.faceMask(camera) {
+            let mask = parsed.clampedToExtent()
+                .applyingFilter("CIMorphologyMaximum", parameters: [
+                    kCIInputRadiusKey: bounds.isNull ? 2 : max(2, bounds.width * 0.02),
+                ])
+                .applyingGaussianBlur(sigma: 1.0)
+                .cropped(to: extent)
+            return text.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                kCIInputBackgroundImageKey: camera,
+                kCIInputMaskImageKey: mask,
+            ]).cropped(to: extent)
+        }
+        // Fallback (model missing): two masks, whichever covers more - the
+        // ARKit mesh (grown outward; it lags behind fast head turns and stops
+        // short of the cheek sides) and the skin found in this very frame
+        // around the face. Edge softened by ~1.5 px.
         let grow = bounds.isNull ? 0 : bounds.width * maskGrow
         let mesh = overlay.clampedToExtent()
             .applyingFilter("CIMorphologyMaximum", parameters: [kCIInputRadiusKey: grow])

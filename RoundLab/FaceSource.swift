@@ -100,6 +100,7 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
         // No age-based dropping: ARKit delivers frames 50+ ms after capture,
         // and a "stale" cut-off dropped every frame for seconds (2026-10-22).
         overlayMs = 0
+        FaceParser.lastMs = 0
         let side = output.side
         let viewport = CGSize(width: side, height: side)
         let intervalMs = lastTimestamp.map { (frame.timestamp - $0) * 1000 } ?? 0
@@ -174,8 +175,9 @@ final class FaceSource: NSObject, FrameSource, ARSessionDelegate {
             duration: CMTime(value: 1, timescale: 30),
             stats: RoundOutput.Stats(
                 intervalMs: intervalMs,
-                trackMs: overlayMs,
-                renderMs: (CACurrentMediaTime() - started) * 1000 - overlayMs,
+                // Tracking = SceneKit overlay + face-parsing network (when used).
+                trackMs: overlayMs + FaceParser.lastMs,
+                renderMs: (CACurrentMediaTime() - started) * 1000 - overlayMs - FaceParser.lastMs,
                 faces: faces,
                 held: false,
                 lost: lost))
