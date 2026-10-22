@@ -16,6 +16,9 @@ protocol FrameSource: AnyObject {
 final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     var holdSeconds: CFTimeInterval = 0.5
+    // A person (body) without a visible face keeps the frame covered; once
+    // nobody is seen for this long the frame is shown as is.
+    var personGraceSeconds: CFTimeInterval = 0.3
 
     private let output: RoundOutput
     private let videoOutput = AVCaptureVideoDataOutput()
@@ -28,6 +31,7 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     private var lastPresentation: CMTime?
     private var lastFaces: [Face] = []
     private var lastFaceTime: CFTimeInterval = -1
+    private var lastPersonTime: CFTimeInterval = -.infinity
     private var position: AVCaptureDevice.Position = .front
     private var input: AVCaptureDeviceInput?
 
@@ -71,6 +75,7 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
             position = next
             lastFaces = []
             lastFaceTime = -1
+            lastPersonTime = CACurrentMediaTime()
             guard configured else {
                 return
             }
@@ -166,11 +171,23 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
         } catch {
             visionFailed = true
         }
+        // No face: is anybody there at all (turned away, hand over the face)?
+        // Only checked on face-less frames, so it costs nothing while a face
+        // is tracked.
+        if faces.isEmpty && !visionFailed {
+            let body = VNDetectHumanRectanglesRequest()
+            body.upperBodyOnly = false
+            if (try? sequenceHandler.perform([body], on: source, orientation: .up)) != nil,
+               !(body.results ?? []).isEmpty {
+                lastPersonTime = CACurrentMediaTime()
+            }
+        }
         let visionEnd = CACurrentMediaTime()
 
         if !faces.isEmpty {
             lastFaces = faces
             lastFaceTime = visionEnd
+            lastPersonTime = visionEnd
         }
         let held = faces.isEmpty
             && lastFaceTime >= 0
@@ -179,7 +196,9 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
         let used = faces.isEmpty
             ? (held ? lastFaces.map { var face = $0; face.hold = holdShare; return face } : [])
             : faces
-        let lost = visionFailed || used.isEmpty
+        // Lost = somebody may be in view but no face to place the effect on.
+        let lost = visionFailed
+            || (used.isEmpty && visionEnd - lastPersonTime <= personGraceSeconds)
 
         let processed = effect.apply(to: source, faces: used, trackingLost: lost, time: presentation.seconds)
         let side = output.side

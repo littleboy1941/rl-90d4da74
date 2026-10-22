@@ -273,7 +273,8 @@ final class Mask {
 // feathered edge. Irreversible: the frame is shrunk 20x before blurring,
 // so a 200 px face keeps ~10 px of color and nothing can be unblurred.
 // A held face (missed for < 0.5 s) keeps its place and grows; after that
-// the whole frame is blurred until a face is found again (fail closed).
+// the whole frame is blurred while a person (body) is still in view but
+// no face is found (fail closed). Nobody in view: the frame is left as is.
 struct BlurEffect: RoundEffect {
     let name = "blur"
     var shrink: CGFloat = 20          // frame downscale before blurring
