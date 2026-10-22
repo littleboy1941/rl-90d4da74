@@ -6,4 +6,5 @@ Test stand for Telegram round video effects on iOS (target: the author's Telegra
 - Modes: `leak` (Elliot poster: LED matrix, face streaks, one Metal pass), `text_face`, `ghost_mesh`, `signal`, `black_silhouette`, `black_oval`.
 - CI: `.github/workflows/build.yml` builds an unsigned IPA with `swiftc` (no Xcode project).
 - PC: `python tools/deploy.py` signs with zsign and installs over USB; `--pull` copies CSV logs and recordings to `logs/`.
+- TestFlight: every push to main is also signed (Apple Distribution) and uploaded by CI when the signing secrets are set (`tools/set_secrets.py`); `python tools/wait_build.py <build>` waits for Apple processing. The LOG button shares the newest CSV and MP4.
 - Logs: one CSV per launch in Documents: frame interval, track/render ms, faces, lost.
