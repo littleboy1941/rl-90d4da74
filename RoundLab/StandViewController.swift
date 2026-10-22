@@ -38,6 +38,8 @@ enum Mode {
 
     static let titles = [
         "blur": "Размытие лиц",
+        "ascii_robot": "ASCII · Mr. Robot",
+        "ascii_lain": "ASCII · Lain",
         "acid": "Acid",
         "melt": "Melt (датамош)",
         "mr_swirl": "Mr. Swirl",
@@ -103,6 +105,9 @@ final class StandViewController: UIViewController {
         fileLabel.textAlignment = .center
         fileLabel.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(fileLabel)
+        // Start on the effect being tested (falls back to the first mode).
+        modeIndex = modes.firstIndex { $0.name == "ascii_robot" } ?? 0
+
         // Which TestFlight build is on the phone (CFBundleVersion = CI run number).
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
         fileLabel.text = "build \(build)"

@@ -19,7 +19,8 @@ def main():
         for n, body in enumerate(re.findall(r'"""\n(.*?)\n\s*"""', text, re.S)):
             if "#include <metal_stdlib>" not in body:
                 continue
-            lines = body.splitlines()
+            # Swift string escapes: what the device compiles has `\\` as `\`.
+            lines = body.replace("\\\\", "\\").splitlines()
             indent = min(len(line) - len(line.lstrip()) for line in lines if line.strip())
             path = out / f"{swift.stem}_{n}.metal"
             path.write_text("\n".join(line[indent:] for line in lines) + "\n", encoding="utf-8")
