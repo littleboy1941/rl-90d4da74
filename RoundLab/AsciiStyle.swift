@@ -247,7 +247,7 @@ final class AsciiGPU {
 
     static uint edgeGlyph(float2 g) {
         // g = brightness gradient (screen x right, y down); the edge runs across it.
-        float a = fmod(degrees(atan2(g.y, g.x)) + 360.0, 180.0);
+        float a = fmod(atan2(g.y, g.x) * 57.29578 + 360.0, 180.0);
         if (a < 22.5 || a >= 157.5) { return uint('|'); }
         if (a < 67.5) { return uint('/'); }
         if (a < 112.5) { return uint('-'); }
