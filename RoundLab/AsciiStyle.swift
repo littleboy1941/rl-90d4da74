@@ -1,9 +1,12 @@
+import ARKit
 import CoreImage
 import Metal
+import SceneKit
 import UIKit
 
-// "ASCII face" (author 2026-10-22): the head is drawn with real everyday
-// Linux command lines on black. Light cells show whole readable commands,
+// "ASCII face" (author 2026-10-22): only the face - the ARKit mesh, forehead
+// to chin - is drawn with real everyday Linux command lines on black; the
+// rest of the frame stays the live camera. Light cells show whole readable commands,
 // darker cells drop letters, and on the face contours only the command
 // syntax that matches the edge direction stays (`/` from paths, `|` from
 // pipes, `-` from flags, `\`). Commands that change or delete things
@@ -23,8 +26,16 @@ struct AsciiStyle: FaceStyle {
         palette == .robot ? "ascii_robot" : "ascii_lain"
     }
 
+    // White unlit face mesh (eyes and mouth closed): the mask of the face.
     func makeNodes(device: MTLDevice) -> [StyledNode] {
-        []
+        guard let mesh = ARSCNFaceGeometry(device: device, fillMesh: true) else {
+            return []
+        }
+        let material = SCNMaterial()
+        material.diffuse.contents = UIColor.white
+        material.lightingModel = .constant
+        mesh.firstMaterial = material
+        return [StyledNode(node: SCNNode(geometry: mesh), scale: 1.0)]
     }
 
     func backdrop(_ camera: CIImage) -> CIImage {
@@ -34,9 +45,15 @@ struct AsciiStyle: FaceStyle {
     func compose(camera: CIImage, overlay: CIImage, face: FaceShape, time: Double) -> CIImage {
         let extent = camera.extent
         // Shader missing (compile error on the device): never show the bare face.
-        return AsciiGPU.shared.run(camera, face: face.bounds, palette: palette,
-                                   scroll: Float(time) * scrollPerSecond)
+        let text = AsciiGPU.shared.run(camera, face: face.bounds, palette: palette,
+                                       scroll: Float(time) * scrollPerSecond)
             ?? camera.applyingFilter("CIPixellate", parameters: [kCIInputScaleKey: 24]).cropped(to: extent)
+        // Mesh alpha, edge softened by ~1.5 px, picks text over the live frame.
+        let mask = overlay.clampedToExtent().applyingGaussianBlur(sigma: 1.5).cropped(to: extent)
+        return text.applyingFilter("CIBlendWithAlphaMask", parameters: [
+            kCIInputBackgroundImageKey: camera,
+            kCIInputMaskImageKey: mask,
+        ]).cropped(to: extent)
     }
 
     func finish(_ image: CIImage, time: Double) -> CIImage {
@@ -269,13 +286,13 @@ final class AsciiGPU {
         uint row = uint(sy / prm.cellH);
         float2 center = float2((float(col) + 0.5) * prm.cellW, (float(row) + 0.5) * prm.cellH);
 
-        // Head ellipse (face box widened to the hair), soft edge.
+        // Only cells near the face box are drawn; the exact face shape comes
+        // from the mesh mask applied after this pass.
         float fade = 0.0;
         if (prm.faceW > 4.0) {
-            float2 head = float2(prm.faceX + prm.faceW * 0.5, prm.faceY + prm.faceH * 0.4);
-            float2 d = (center - head) / float2(prm.faceW * 0.8, prm.faceH * 0.95);
-            float inside = dot(d, d);
-            fade = 1.0 - smoothstep(0.75, 1.0, inside);
+            float2 lo = float2(prm.faceX, prm.faceY) - float2(prm.faceW, prm.faceH) * 0.1;
+            float2 hi = float2(prm.faceX + prm.faceW, prm.faceY + prm.faceH) + float2(prm.faceW, prm.faceH) * 0.1;
+            fade = all(center >= lo) && all(center <= hi) ? 1.0 : 0.0;
         }
         float3 color = float3(0.0);
         if (fade > 0.0) {
