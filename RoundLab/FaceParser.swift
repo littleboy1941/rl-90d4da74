@@ -6,20 +6,30 @@ import QuartzCore
 // Per-frame face mask from a face-parsing network (YOLO26-nano, 19 classes,
 // CelebAMask-HQ; Models/FaceParsing.mlpackage, compiled into the app by CI).
 // Unlike the ARKit mesh, the mask comes from the very frame it is applied
-// to, so it does not lag behind fast head turns. Face = skin, nose, glasses,
-// eyes, brows, mouth, lips (no ears, hair, neck). Soft edge from the summed
-// class probabilities.
+// to, so it does not lag behind fast head turns. Mask = the whole head:
+// face parts plus ears, hair, hat (no neck, clothes) - the edge then runs
+// along the head outline against the background, which the network sees
+// far more surely than the forehead/hair line. Soft edge from the summed
+// class probabilities, steadied over frames (see `stabilize`).
 final class FaceParser {
     static let shared = FaceParser()
     static let side = 512                       // model input
     static let grid = 64                        // logits grid
-    static let cropScale: CGFloat = 1.7         // crop side, of the face box
-    static let faceClasses: Set<Int> = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12]
+    static let cropScale: CGFloat = 2.0         // crop side, of the face box (hair fits)
+    static let faceClasses: Set<Int> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    static let keep: Float = 0.45               // share of the previous frame in the average
+    static let enter: Float = 0.6               // a cell joins the mask above this...
+    static let leave: Float = 0.4               // ...and leaves it below this
 
     static var lastMs = 0.0                    // this frame's prediction, for the frame log
     private let model: MLModel?
     private let context = CIContext(options: [.cacheIntermediates: false])
     private var input: CVPixelBuffer?
+    // Previous frame, in crop cells (the crop follows the head, so a cell
+    // stays on about the same spot of the head between frames).
+    private var lastCrop = CGRect.null
+    private var average = [Float]()
+    private var inside = [Bool]()
 
     private init() {
         let config = MLModelConfiguration()
@@ -51,8 +61,10 @@ final class FaceParser {
             let side = max(extent.width, extent.height)
             crop = CGRect(x: extent.minX, y: extent.minY, width: side, height: side)
         } else {
+            // Centre raised by 10% of the face height: room for the hair above.
             let side = max(face.width, face.height) * Self.cropScale
-            crop = CGRect(x: face.midX - side / 2, y: face.midY - side / 2, width: side, height: side)
+            crop = CGRect(x: face.midX - side / 2, y: face.midY + face.height * 0.1 - side / 2,
+                          width: side, height: side)
         }
         let scale = CGFloat(Self.side) / crop.width
         // Edge pixels repeated past the frame border, so the crop never sees black.
@@ -66,7 +78,7 @@ final class FaceParser {
               let logits = output.featureValue(for: "logits")?.multiArrayValue else {
             return nil
         }
-        let probability = Self.faceProbability(logits)
+        let probability = stabilize(Self.faceProbability(logits), crop: crop)
         guard let small = Self.grayImage(probability, side: Self.grid) else {
             return nil
         }
@@ -87,6 +99,40 @@ final class FaceParser {
             .applyingFilter("CIColorClamp")
             .transformed(by: CGAffineTransform(translationX: crop.minX, y: crop.minY))
             .cropped(to: extent)
+    }
+
+    // Against the edge jumping: the probability is averaged with the
+    // previous frame, and a cell switches in or out of the mask only past
+    // a margin (hysteresis: in above 0.6, out below 0.4, else as before).
+    // Reset when the crop jumps (new face, big move or size change).
+    private func stabilize(_ bytes: [UInt8], crop: CGRect) -> [UInt8] {
+        let count = bytes.count
+        let fresh = bytes.map { Float($0) / 255 }
+        let steady = !lastCrop.isNull && average.count == count
+            && abs(crop.width / lastCrop.width - 1) < 0.15
+            && hypot(crop.midX - lastCrop.midX, crop.midY - lastCrop.midY) < crop.width * 0.1
+        lastCrop = crop
+        if !steady {
+            average = fresh
+            inside = fresh.map { $0 >= 0.5 }
+        } else {
+            for i in 0..<count {
+                average[i] = average[i] * Self.keep + fresh[i] * (1 - Self.keep)
+            }
+        }
+        var out = [UInt8](repeating: 0, count: count)
+        for i in 0..<count {
+            let p = average[i]
+            if p > Self.enter {
+                inside[i] = true
+            } else if p < Self.leave {
+                inside[i] = false
+            }
+            // Keep the soft value, but on the side of 0.5 that the state says.
+            let shown = inside[i] ? max(p, 0.55) : min(p, 0.45)
+            out[i] = UInt8(min(255, max(0, shown * 255)))
+        }
+        return out
     }
 
     // Softmax over the 19 classes per cell, summed over the face classes;

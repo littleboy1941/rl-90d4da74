@@ -52,10 +52,11 @@ struct AsciiStyle: FaceStyle {
         let bounds = face.bounds
         // Main mask: the face-parsing network on this very frame (no lag).
         let parsed = FaceParser.shared.faceMask(camera, around: bounds)
-        // With the network mask the text box is widened, so every masked
-        // pixel gets characters (the mask may reach past the ARKit box).
-        let textBox = parsed == nil || bounds.isNull
-            ? bounds : bounds.insetBy(dx: -bounds.width * 0.15, dy: -bounds.height * 0.2)
+        // With the network mask (whole head) the text box is widened, so every
+        // masked pixel gets characters: hair above and at the sides.
+        let textBox = parsed == nil || bounds.isNull ? bounds : CGRect(
+            x: bounds.minX - bounds.width * 0.3, y: bounds.minY - bounds.height * 0.15,
+            width: bounds.width * 1.6, height: bounds.height * 1.75)
         guard let result = AsciiGPU.shared.run(camera, face: textBox, palette: palette,
                                                scroll: Float(time) * scrollPerSecond) else {
             // Shader missing (compile error on the device): never show the bare face.
@@ -413,7 +414,7 @@ final class AsciiGPU {
                     ink = float3(gv, gv * 0.94, gv * 0.96);
                 }
             } else {
-                draw = draw && v >= 0.06;
+                v = max(v, 0.16);          // dark hair and shadows: dim text, not a hole
                 if (tinted && !edge) {
                     ink = float3(0.9 * max(v, 0.5), 0.11, 0.15);
                 } else {
