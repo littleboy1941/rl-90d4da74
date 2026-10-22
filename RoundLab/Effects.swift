@@ -4,11 +4,13 @@ import CoreImage
 // One tracked face in source pixel coordinates (Core Image coordinates,
 // origin at the bottom left). Contour runs along the jaw from ear to ear;
 // empty when Vision returned no landmarks. `hold` is 0 for a face seen in
-// this frame and grows to 1 while the last seen face is held after a miss.
+// this frame and grows to 1 while the last seen face is held after a miss;
+// `streak` counts consecutive frames the face was found in.
 struct Face {
     var rect: CGRect
     var contour: [CGPoint]
     var hold: CGFloat = 0
+    var streak = 1
 }
 
 // Effect contract shared with the future Telegram port: Telegram's round
@@ -204,13 +206,13 @@ enum Silhouette {
         return mask
     }
 
-    static func path(_ face: Face) -> CGPath {
+    static func path(_ face: Face, lift: CGFloat = foreheadLift) -> CGPath {
         let path = CGMutablePath()
         let rect = face.rect
         guard face.contour.count >= 3,
               let first = face.contour.first,
               let last = face.contour.last else {
-            path.addEllipse(in: rect.insetBy(dx: 0, dy: -rect.height * foreheadLift / 2))
+            path.addEllipse(in: rect.insetBy(dx: 0, dy: -rect.height * lift / 2))
             return path
         }
         path.move(to: first)
@@ -218,7 +220,7 @@ enum Silhouette {
             path.addLine(to: point)
         }
         // Forehead: arc from the last contour point over the top back to the first.
-        let top = CGPoint(x: (first.x + last.x) / 2, y: rect.maxY + rect.height * foreheadLift)
+        let top = CGPoint(x: (first.x + last.x) / 2, y: rect.maxY + rect.height * lift)
         path.addQuadCurve(
             to: CGPoint(x: (last.x + top.x) / 2, y: top.y),
             control: CGPoint(x: last.x, y: top.y))
@@ -268,41 +270,47 @@ final class Mask {
     }
 }
 
-// Real censoring blur (author's choice 2026-10-22): every head in the frame
-// (face box widened to hair and ears) under a strong soft blur with a
-// feathered edge. Irreversible: the frame is shrunk 20x before blurring,
-// so a 200 px face keeps ~10 px of color and nothing can be unblurred.
-// A held face (missed for < 0.5 s) keeps its place and grows; after that
-// the whole frame is blurred while a person (body) is still in view but
-// no face is found (fail closed). Nobody in view: the frame is left as is.
+// Real censoring blur (author 2026-10-22: only the face): every face in
+// the frame - jaw contour from Vision landmarks closed over the forehead -
+// under a strong soft blur with a small feathered margin; hair, ears and
+// people seen from the back stay as they are. Irreversible: the frame is
+// shrunk 20x before blurring, so a 200 px face keeps ~10 px of color and
+// nothing can be unblurred. A steady face missed for < 0.5 s keeps its
+// place and grows a little (fast turns); no face -> nothing is blurred.
 struct BlurEffect: RoundEffect {
     let name = "blur"
     var shrink: CGFloat = 20          // frame downscale before blurring
-    var headWidth: CGFloat = 1.6      // of the face box width
-    var headHeight: CGFloat = 1.9     // of the face box height
-    var headLift: CGFloat = 0.12      // oval center above the box center, of its height
-    var holdGrowth: CGFloat = 0.5     // extra size at the end of a hold
-    var feather: CGFloat = 0.08       // edge softness, of the head width
+    var margin: CGFloat = 0.08        // around the contour, of the face width
+    var foreheadLift: CGFloat = 0.3   // forehead above the box, of its height
+    var holdGrowth: CGFloat = 0.3     // extra size at the end of a hold
+    var feather: CGFloat = 0.04       // edge softness, of the face width
 
     func apply(to image: CIImage, faces: [Face], trackingLost: Bool, time: Double) -> CIImage {
         let extent = image.extent
-        let blurred = Self.heavyBlur(image, shrink: shrink)
-        if trackingLost {
-            return blurred
+        guard !faces.isEmpty else {
+            return image
         }
-        // Feather outward only: each oval is drawn larger by 2 sigma, so after
-        // blurring the mask the oval itself is still fully covered.
+        let blurred = Self.heavyBlur(image, shrink: shrink)
+        // The margin is 2 sigma of the feather, so the face itself stays
+        // fully covered after the mask is blurred.
         let mask = Mask(extent: extent)
         var widest: CGFloat = 0
         for face in faces {
             let grow = 1 + holdGrowth * min(max(face.hold, 0), 1)
-            let width = face.rect.width * headWidth * grow
-            let height = face.rect.height * headHeight * grow
-            let pad = width * feather * 2
-            let center = CGPoint(x: face.rect.midX, y: face.rect.midY + face.rect.height * headLift)
-            mask.context?.fillEllipse(in: CGRect(
-                x: center.x - width / 2 - pad, y: center.y - height / 2 - pad,
-                width: width + pad * 2, height: height + pad * 2))
+            let center = CGPoint(x: face.rect.midX, y: face.rect.midY)
+            var scale = CGAffineTransform(translationX: center.x, y: center.y)
+                .scaledBy(x: grow, y: grow)
+                .translatedBy(x: -center.x, y: -center.y)
+            guard let path = Silhouette.path(face, lift: foreheadLift).copy(using: &scale) else {
+                continue
+            }
+            let width = face.rect.width * grow
+            mask.context?.addPath(path)
+            mask.context?.fillPath()
+            mask.context?.setLineJoin(.round)
+            mask.context?.setLineWidth(width * margin * 2)
+            mask.context?.addPath(path)
+            mask.context?.strokePath()
             widest = max(widest, width)
         }
         guard let alpha = mask.ciImage() else {

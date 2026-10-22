@@ -16,9 +16,12 @@ protocol FrameSource: AnyObject {
 final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleBufferDelegate {
     let session = AVCaptureSession()
     var holdSeconds: CFTimeInterval = 0.5
-    // A person (body) without a visible face keeps the frame covered; once
-    // nobody is seen for this long the frame is shown as is.
-    var personGraceSeconds: CFTimeInterval = 0.3
+    // Only a face found this many frames in a row is held after a miss, so a
+    // one-frame false detection does not hang on screen for the hold time.
+    var steadyFrames = 3
+    // Weaker or smaller detections are dropped as false faces.
+    var minConfidence: Float = 0.5
+    var minFaceShare: CGFloat = 0.04          // of the frame width
 
     private let output: RoundOutput
     private let videoOutput = AVCaptureVideoDataOutput()
@@ -31,7 +34,7 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
     private var lastPresentation: CMTime?
     private var lastFaces: [Face] = []
     private var lastFaceTime: CFTimeInterval = -1
-    private var lastPersonTime: CFTimeInterval = -.infinity
+    private var previousFaces: [Face] = []
     private var position: AVCaptureDevice.Position = .front
     private var input: AVCaptureDeviceInput?
 
@@ -75,7 +78,7 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
             position = next
             lastFaces = []
             lastFaceTime = -1
-            lastPersonTime = CACurrentMediaTime()
+            previousFaces = []
             guard configured else {
                 return
             }
@@ -163,31 +166,32 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
         let request = VNDetectFaceLandmarksRequest()
         do {
             try sequenceHandler.perform([request], on: source, orientation: .up)
-            faces = (request.results ?? []).map { observation in
-                Face(
-                    rect: VNImageRectForNormalizedRect(observation.boundingBox, width, height),
-                    contour: observation.landmarks?.faceContour?.pointsInImage(imageSize: size) ?? [])
+            faces = (request.results ?? [])
+                .filter { $0.confidence >= minConfidence }
+                .map { observation in
+                    Face(
+                        rect: VNImageRectForNormalizedRect(observation.boundingBox, width, height),
+                        contour: observation.landmarks?.faceContour?.pointsInImage(imageSize: size) ?? [])
+                }
+                .filter { $0.rect.width >= CGFloat(width) * minFaceShare }
+            faces = faces.map { face in
+                var face = face
+                face.streak = 1 + (previousFaces
+                    .filter { Self.overlap($0.rect, face.rect) > 0.3 }
+                    .map(\.streak)
+                    .max() ?? 0)
+                return face
             }
         } catch {
             visionFailed = true
         }
-        // No face: is anybody there at all (turned away, hand over the face)?
-        // Only checked on face-less frames, so it costs nothing while a face
-        // is tracked.
-        if faces.isEmpty && !visionFailed {
-            let body = VNDetectHumanRectanglesRequest()
-            body.upperBodyOnly = false
-            if (try? sequenceHandler.perform([body], on: source, orientation: .up)) != nil,
-               !(body.results ?? []).isEmpty {
-                lastPersonTime = CACurrentMediaTime()
-            }
-        }
         let visionEnd = CACurrentMediaTime()
+        previousFaces = faces
 
-        if !faces.isEmpty {
-            lastFaces = faces
+        let steady = faces.filter { $0.streak >= steadyFrames }
+        if !steady.isEmpty {
+            lastFaces = steady
             lastFaceTime = visionEnd
-            lastPersonTime = visionEnd
         }
         let held = faces.isEmpty
             && lastFaceTime >= 0
@@ -196,9 +200,7 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
         let used = faces.isEmpty
             ? (held ? lastFaces.map { var face = $0; face.hold = holdShare; return face } : [])
             : faces
-        // Lost = somebody may be in view but no face to place the effect on.
-        let lost = visionFailed
-            || (used.isEmpty && visionEnd - lastPersonTime <= personGraceSeconds)
+        let lost = visionFailed || used.isEmpty
 
         let processed = effect.apply(to: source, faces: used, trackingLost: lost, time: presentation.seconds)
         let side = output.side
@@ -235,5 +237,15 @@ final class VisionSource: NSObject, FrameSource, AVCaptureVideoDataOutputSampleB
                 faces: faces.count,
                 held: held,
                 lost: lost))
+    }
+
+    // Intersection over union of two face boxes.
+    static func overlap(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let common = a.intersection(b)
+        guard !common.isNull else {
+            return 0
+        }
+        let shared = common.width * common.height
+        return shared / (a.width * a.height + b.width * b.height - shared)
     }
 }
