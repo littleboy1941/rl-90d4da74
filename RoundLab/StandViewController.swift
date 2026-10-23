@@ -32,12 +32,22 @@ enum Mode {
         return false
     }
 
+    // Effects made for one camera (author 2026-10-23: the TV static stays
+    // on the front camera, blob tracking is for the back one).
+    static let frontOnly: Set = ["tv_static_body", "tv_static_body_hq", "tv_static_body_40"]
+    static let backOnly: Set = ["blob_track"]
+
+    func fits(back: Bool) -> Bool {
+        back ? !needsFront && !Self.frontOnly.contains(name) : !Self.backOnly.contains(name)
+    }
+
     var title: String {
         Self.titles[name] ?? name
     }
 
     static let titles = [
         "blur": "Размытие лиц",
+        "blob_track": "Блоб-трекинг",
         "tv_static_body": "ТВ-шум на всё тело · быстро",
         "tv_static_body_hq": "ТВ-шум на всё тело · точно",
         "tv_static_body_40": "ТВ-шум на всё тело · как в 40",
@@ -266,10 +276,10 @@ final class StandViewController: UIViewController {
         windowStart = now
     }
 
-    // Effect list; on the back camera only the Vision effects are offered.
+    // Effect list: only the effects for this camera (no ARKit on the back).
     private func makeMenu() -> UIMenu {
         let actions = modes.indices
-            .filter { !backCamera || !modes[$0].needsFront }
+            .filter { modes[$0].fits(back: backCamera) }
             .map { index in
                 UIAction(title: modes[index].title, state: index == modeIndex ? .on : .off) { [weak self] _ in
                     self?.select(index)
@@ -299,13 +309,15 @@ final class StandViewController: UIViewController {
         apply(modes[modeIndex])
     }
 
-    // Back camera: Vision path only (ARKit face tracking is front-only);
-    // a 3D style falls back to the blur.
+    // Back camera: Vision path only (ARKit face tracking is front-only).
+    // An effect made for the other camera switches to this camera's own
+    // (blob tracking on the back, TV static on the front).
     @objc private func flipCamera() {
         backCamera.toggle()
         visionSource.setPosition(backCamera ? .back : .front)
-        if backCamera, modes[modeIndex].needsFront {
-            modeIndex = 0
+        if !modes[modeIndex].fits(back: backCamera) {
+            let own = backCamera ? "blob_track" : "tv_static_body"
+            modeIndex = modes.firstIndex { $0.name == own } ?? 0
         }
         apply(modes[modeIndex])
     }
