@@ -1,19 +1,21 @@
 """PC preview of `blob tracking` for the back camera (author 2026-10-23,
-references in fff PROJECT_NOTES, "breakcore для задней камеры"): a white
-HUD over the camera - corner brackets around blobs with `x:### y:###`,
-small squares on points, thin lines between neighbours, a dashed line
-through the blobs. Only the HUD for now (no glitch fill).
+references in fff PROJECT_NOTES, "breakcore для задней камеры"; v2 with
+corner brackets and `x:y` labels was "too sloppy", v3 follows the neater
+reference `1979402827_1_tiktok_...mp4`):
+  - the picture as a black-and-white engraving (high-pass + threshold),
+    `--colour` keeps the camera colours instead;
+  - thin 1 px rectangles on the textured spots only, many sizes,
+    overlapping; some are inverted inside;
+  - a 4-digit number in a monospace font inside each box;
+  - a small red dot in the centre of most boxes;
+  - long thin lines joining box centres.
 
-    python tools/sim_blobtrack.py <clip.mp4> <out.mp4> [--sheet out.png]
+    python tools/sim_blobtrack.py <clip.mp4> <out.mp4> [--colour]
 
-Everything is found on a 100 px copy of the frame, so the phone can do
-the same on the CPU:
-  blobs  - connected spots of (motion | the brightest 6 %), 4..40 % of
-           the side, not touching the frame edge; up to 4, the biggest;
-  points - Shi-Tomasi corners, up to 8, at least 12 px apart.
-Lines longer than 30 % of the side (dashed: 50 %) are not drawn.
-Both are tracked: matched to the nearest of the last frame, the position
-eased, shown after 2 frames seen, kept 4 frames after being lost.
+Found on a 100 px copy of the frame (the phone can do the same on the
+CPU): boxes are the most detailed spots of the frame (local contrast),
+at two scales (big and small boxes). Tracked: matched to the
+nearest of the last frame, eased, shown after 2 frames, kept 4 frames.
 """
 import subprocess
 import sys
@@ -26,10 +28,9 @@ SIDE = 400
 FPS = 30
 SMALL = 100
 SCALE = SIDE / SMALL
-FONT = ImageFont.truetype(r"C:\Windows\Fonts\arial.ttf", 11)
-WHITE = (255, 255, 255)
-MAX_LINE = SIDE * 0.3      # longer thin lines are dropped
-MAX_DASH = SIDE * 0.5
+FONT = ImageFont.truetype(r"C:\Windows\Fonts\consola.ttf", 10)
+WHITE = (235, 235, 235)
+RED = (200, 20, 30)
 
 
 class Tracks:
@@ -67,119 +68,91 @@ class Tracks:
         return [it for it in self.items if it["seen"] >= 2]
 
 
-def find_blobs(gray, prev):
-    motion = cv2.GaussianBlur(cv2.absdiff(gray, prev), (0, 0), 1.5) > 18
-    bright = gray >= np.percentile(gray, 94)
-    spots = (motion | bright).astype(np.uint8)
-    spots = cv2.morphologyEx(spots, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    n, _, stats, _ = cv2.connectedComponentsWithStats(spots)
+DITHER = np.random.default_rng(5).random((SIDE, SIDE)).astype(np.float32)
+
+
+def engrave(gray):
+    """Stipple: dark stays black, light parts and edges turn into fine
+    white specks (fixed dither noise). Brightness is stretched per frame
+    (2nd..99th percentile) and bent down, so only the light parts are dense."""
+    g = gray.astype(np.float32)
+    lo, hi = np.percentile(g, 2), np.percentile(g, 99)
+    g = np.clip((g - lo) / max(hi - lo, 1), 0, 1)
+    hp = g - cv2.GaussianBlur(g, (0, 0), 2.0)
+    v = np.clip(g ** 2.2 * 0.9 + np.abs(hp) * 3, 0, 1)
+    return (v > DITHER).astype(np.uint8) * 255
+
+
+def find_boxes(gray_small):
+    """Boxes on the most detailed spots: local contrast (std in a small
+    window), the top 22 % of this frame, connected, at two scales."""
+    g = gray_small.astype(np.float32)
+    mean = cv2.blur(g, (5, 5))
+    std = np.sqrt(np.maximum(cv2.blur(g * g, (5, 5)) - mean * mean, 0))
     found = []
-    for x, y, w, h, area in stats[1:]:
-        side = max(w, h)
-        touches = x <= 0 or y <= 0 or x + w >= SMALL or y + h >= SMALL
-        if 4 <= side <= 40 and area >= 6 and not touches:
-            found.append((area, (x, y, x + w, y + h)))
-    found.sort(reverse=True)
-    return [box for _, box in found[:4]]
+    for sigma, top, limit in ((2.5, 0.12, 8), (0.8, 0.22, 14)):
+        detail = cv2.GaussianBlur(std, (0, 0), sigma)
+        spots = (detail >= np.quantile(detail, 1 - top)).astype(np.uint8)
+        n, _, stats, _ = cv2.connectedComponentsWithStats(spots)
+        level_boxes = []
+        for x, y, w, h, area in stats[1:]:
+            touches = x <= 0 or y <= 0 or x + w >= SMALL or y + h >= SMALL
+            if 3 <= max(w, h) <= 30 and area >= 5 and not touches:
+                level_boxes.append((area, (x, y, x + w, y + h)))
+        level_boxes.sort(reverse=True)
+        found += [box for _, box in level_boxes[:limit]]
+    return found
 
 
-def find_points(gray):
-    corners = cv2.goodFeaturesToTrack(gray, 8, 0.08, 12)
-    if corners is None:
-        return []
-    return [(x - 1, y - 1, x + 1, y + 1) for x, y in corners.reshape(-1, 2)]
+def number(track_id):
+    return f"{(track_id * 7919 + 1973) % 9000 + 1000}"
 
 
-def dashed(draw, a, b, width=2, dash=7, gap=5):
-    a, b = np.array(a, float), np.array(b, float)
-    length = np.hypot(*(b - a))
-    if length < 1:
-        return
-    u = (b - a) / length
-    s = 0.0
-    while s < length:
-        e = min(s + dash, length)
-        draw.line([tuple(a + u * s), tuple(a + u * e)], fill=WHITE, width=width)
-        s = e + gap
-
-
-def brackets(draw, box, arm=0.3):
-    x0, y0, x1, y1 = box
-    ax, ay = max(4, (x1 - x0) * arm), max(4, (y1 - y0) * arm)
-    for cx, cy, sx, sy in ((x0, y0, 1, 1), (x1, y0, -1, 1), (x0, y1, 1, -1), (x1, y1, -1, -1)):
-        draw.line([(cx, cy), (cx + sx * ax, cy)], fill=WHITE, width=2)
-        draw.line([(cx, cy), (cx, cy + sy * ay)], fill=WHITE, width=2)
-
-
-def hud(img, blobs, points):
-    im = Image.fromarray(img)
+def hud(base, boxes):
+    im = Image.fromarray(base)
     draw = ImageDraw.Draw(im)
     centres = []
-    for it in blobs:
-        x0, y0, x1, y1 = it["box"] * SCALE
-        pad = 6 + max(0, 24 - max(x1 - x0, y1 - y0)) / 2   # brackets at least ~36 px
-        box = (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
-        brackets(draw, box)
+    for it in sorted(boxes, key=lambda it: it["id"]):
+        x0, y0, x1, y1 = (it["box"] * SCALE).round().astype(int)
+        x0, y0, x1, y1 = max(x0 - 3, 0), max(y0 - 3, 0), min(x1 + 3, SIDE - 1), min(y1 + 3, SIDE - 1)
+        if it["id"] % 4 == 1 and x1 > x0 and y1 > y0:
+            region = im.crop((x0, y0, x1, y1))
+            im.paste(Image.eval(region, lambda v: 255 - v), (x0, y0))
+        draw.rectangle([x0, y0, x1, y1], outline=WHITE, width=1)
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
         centres.append((cx, cy))
-        draw.text((box[2] + 3, cy - 6), f"x:{int(cx)} y:{int(cy)}", fill=WHITE, font=FONT)
-    pts = []
-    for it in points:
-        x0, y0, x1, y1 = it["box"] * SCALE
-        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        pts.append((cx, cy))
-        r = 5
-        draw.rectangle([cx - r, cy - r, cx + r, cy + r], outline=WHITE, width=1)
-        if it["id"] % 3 == 0:
-            draw.text((cx + r + 3, cy - r - 2), f"x:{int(cx)} y:{int(cy)}", fill=WHITE, font=FONT)
-    # Thin lines: every point to its nearest other point and to the
-    # nearest blob; a dashed line through the blobs from left to right.
-    for i, p in enumerate(pts):
-        others = [q for j, q in enumerate(pts) if j != i]
-        if others:
-            q = min(others, key=lambda q: np.hypot(q[0] - p[0], q[1] - p[1]))
-            if np.hypot(q[0] - p[0], q[1] - p[1]) < MAX_LINE:
-                draw.line([p, q], fill=WHITE, width=1)
-        if centres:
-            c = min(centres, key=lambda c: np.hypot(c[0] - p[0], c[1] - p[1]))
-            if np.hypot(c[0] - p[0], c[1] - p[1]) < MAX_LINE:
-                draw.line([p, c], fill=WHITE, width=1)
-    for a, b in zip(sorted(centres), sorted(centres)[1:]):
-        if np.hypot(b[0] - a[0], b[1] - a[1]) < MAX_DASH:
-            dashed(draw, a, b)
+        if x1 - x0 >= 22:
+            draw.text((cx - 4, cy - 12), number(it["id"]), fill=WHITE, font=FONT)
+        if it["id"] % 3 != 2:
+            draw.ellipse([cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5], fill=RED)
+    # Long thin lines: every box to the one two ids further.
+    for a, b in zip(centres, centres[2:]):
+        draw.line([a, b], fill=(200, 200, 200), width=1)
     return np.asarray(im)
 
 
 def main():
     src, dst = sys.argv[1], sys.argv[2]
+    colour = "--colour" in sys.argv
     cap = cv2.VideoCapture(src)
     enc = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{SIDE}x{SIDE}",
          "-r", str(FPS), "-i", "-", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", dst],
         stdin=subprocess.PIPE)
-    blob_tracks, point_tracks = Tracks(reach=12, ease=0.6), Tracks(reach=6, ease=0.7)
-    prev, kept = None, []
+    tracks = Tracks(reach=8, ease=0.6)
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         frame = cv2.resize(frame, (SIDE, SIDE), interpolation=cv2.INTER_AREA)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        gray = cv2.cvtColor(cv2.resize(frame, (SMALL, SMALL), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-        blobs = blob_tracks.update(find_blobs(gray, prev if prev is not None else gray))
-        points = point_tracks.update(find_points(gray))
-        prev = gray
-        out = hud(rgb, blobs, points)
-        enc.stdin.write(out.tobytes())
-        if len(kept) < 48:
-            kept.append(out)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        ink = engrave(gray)
+        base = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if colour else np.repeat(ink[..., None], 3, -1)
+        gray_small = cv2.resize(gray, (SMALL, SMALL), interpolation=cv2.INTER_AREA)
+        boxes = tracks.update(find_boxes(gray_small))
+        enc.stdin.write(hud(base, boxes).tobytes())
     enc.stdin.close()
     enc.wait()
-    if "--sheet" in sys.argv:
-        picks = kept[::4][:12]
-        rows = [np.concatenate(picks[r * 4:(r + 1) * 4], 1) for r in range(3)]
-        sheet = np.concatenate(rows, 0)
-        cv2.imwrite(sys.argv[sys.argv.index("--sheet") + 1], cv2.cvtColor(sheet, cv2.COLOR_RGB2BGR))
     print("wrote", dst)
 
 
