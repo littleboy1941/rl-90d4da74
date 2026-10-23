@@ -17,8 +17,7 @@ import Vision
 // moment): `motion` also covers whatever moved since the last frame close
 // to the person (a blurred hand the segmentation lost), and the mask is
 // grown more around each head (`headGrow`, hair edge). Build 40 stays as
-// `build40` to compare. Build 42 (author on 41: hair fine, a waving hand
-// still shows): hands are found on their own (`PersonMask.hands`).
+// `build40` to compare.
 struct TVStaticBodyEffect: RoundEffect {
     let name: String
     let mask: PersonMask
@@ -31,8 +30,7 @@ struct TVStaticBodyEffect: RoundEffect {
     static let fast = TVStaticBodyEffect(name: "tv_static_body", mask: PersonMask(quality: .balanced, visionSmoothing: false))
     static let accurate = TVStaticBodyEffect(name: "tv_static_body_hq", mask: PersonMask(quality: .accurate, visionSmoothing: false))
     static let build40 = TVStaticBodyEffect(
-        name: "tv_static_body_40", mask: PersonMask(quality: .balanced, visionSmoothing: false, hands: false),
-        motion: false, headGrow: 0)
+        name: "tv_static_body_40", mask: PersonMask(quality: .balanced, visionSmoothing: false), motion: false, headGrow: 0)
 
     func apply(to image: CIImage, faces: [Face], trackingLost: Bool, time: Double) -> CIImage {
         let extent = image.extent
@@ -113,40 +111,23 @@ final class PersonMask {
     private var frames: [CVPixelBuffer] = []
     private var frameIndex = 0
     private var hasPrevious = false
-    // Hands (build 42): on the recording of build 41 the segmentation lost
-    // a raised palm for 2-3 frames at the top of each wave, sharp and
-    // standing still, so the motion check saw nothing either. Hand pose
-    // finds it by its joints; every found hand is drawn into the held mask
-    // as discs around the joints and kept for `handFrames` frames.
-    let hands: Bool
-    var handFrames = 9                // ~0.3 s at 30 fps
-    var handRadius: CGFloat = 0.3     // disc around a joint, of the hand size
-    var handConfidence: Float = 0.3   // weakest joint that counts
-    private let handRequest = VNDetectHumanHandPoseRequest()
-    private var seenHands: [(points: [CGPoint], age: Int)] = []   // normalized, Vision's lower-left origin
 
-    init(quality: VNGeneratePersonSegmentationRequest.QualityLevel, visionSmoothing: Bool, hands: Bool = true) {
+    init(quality: VNGeneratePersonSegmentationRequest.QualityLevel, visionSmoothing: Bool) {
         self.visionSmoothing = visionSmoothing
-        self.hands = hands
         request.qualityLevel = quality
         request.outputPixelFormat = kCVPixelFormatType_OneComponent8
-        handRequest.maximumHandCount = 4
     }
 
     func mask(_ image: CIImage) -> CIImage? {
         let extent = image.extent
-        let requests: [VNRequest] = hands ? [request, handRequest] : [request]
         if visionSmoothing {
-            guard (try? handler.perform(requests, on: image, orientation: .up)) != nil else {
+            guard (try? handler.perform([request], on: image, orientation: .up)) != nil else {
                 return nil
             }
         } else {
-            guard (try? VNImageRequestHandler(ciImage: image, orientation: .up).perform(requests)) != nil else {
+            guard (try? VNImageRequestHandler(ciImage: image, orientation: .up).perform([request])) != nil else {
                 return nil
             }
-        }
-        if hands {
-            collectHands()
         }
         guard let segmented = request.results?.first?.pixelBuffer,
               let pixels = visionSmoothing ? segmented : hold(segmented) else {
@@ -224,24 +205,7 @@ final class PersonMask {
             .cropped(to: extent)
     }
 
-    // Ages the hands seen before, drops the old ones, adds this frame's.
-    private func collectHands() {
-        seenHands = seenHands
-            .filter { $0.age + 1 < handFrames }
-            .map { (points: $0.points, age: $0.age + 1) }
-        for hand in handRequest.results ?? [] {
-            guard let joints = try? hand.recognizedPoints(.all) else {
-                continue
-            }
-            let points = joints.values.filter { $0.confidence >= handConfidence }.map { $0.location }
-            if points.count >= 4 {
-                seenHands.append((points: points, age: 0))
-            }
-        }
-    }
-
-    // max(this frame, last result faded), into one of two own buffers;
-    // the hands are drawn on top at full strength.
+    // max(this frame, last result faded), into one of two own buffers.
     private func hold(_ source: CVPixelBuffer) -> CVPixelBuffer? {
         let width = CVPixelBufferGetWidth(source)
         let height = CVPixelBufferGetHeight(source)
@@ -272,7 +236,6 @@ final class PersonMask {
         let inRow = CVPixelBufferGetBytesPerRow(source)
         let outRow = CVPixelBufferGetBytesPerRow(target)
         let keep = UInt16(fade * 256)
-        let held = seenHands
         history.withUnsafeMutableBufferPointer { last in
             for y in 0..<height {
                 for x in 0..<width {
@@ -280,33 +243,6 @@ final class PersonMask {
                     let value = max(input[y * inRow + x], UInt8((UInt16(last[i]) * keep) >> 8))
                     last[i] = value
                     output[y * outRow + x] = value
-                }
-            }
-            for hand in held {
-                // Buffer rows go top down, Vision's y goes bottom up.
-                let pixels = hand.points.map { CGPoint(x: $0.x * CGFloat(width), y: (1 - $0.y) * CGFloat(height)) }
-                let xs = pixels.map(\.x)
-                let ys = pixels.map(\.y)
-                let size = max((xs.max() ?? 0) - (xs.min() ?? 0), (ys.max() ?? 0) - (ys.min() ?? 0))
-                let radius = max(2, size * handRadius)
-                for point in pixels {
-                    let x0 = max(0, Int(point.x - radius))
-                    let x1 = min(width - 1, Int(point.x + radius))
-                    let y0 = max(0, Int(point.y - radius))
-                    let y1 = min(height - 1, Int(point.y + radius))
-                    guard x0 <= x1, y0 <= y1 else {
-                        continue
-                    }
-                    for y in y0...y1 {
-                        for x in x0...x1 {
-                            let dx = CGFloat(x) - point.x
-                            let dy = CGFloat(y) - point.y
-                            if dx * dx + dy * dy <= radius * radius {
-                                last[y * width + x] = 255
-                                output[y * outRow + x] = 255
-                            }
-                        }
-                    }
                 }
             }
         }
